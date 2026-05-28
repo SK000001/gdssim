@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Viewport, type SceneData, type LayerInfo } from "./viewport";
+import { Viewport, type SceneData, type LayerInfo, type Diag } from "./viewport";
 import "./App.css";
 
 type Summary = {
@@ -20,6 +20,7 @@ function App() {
   const [hidden, setHidden] = useState<Set<number>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [diag, setDiag] = useState<Diag | null>(null);
 
   useEffect(() => {
     if (!canvasRef.current) return;
@@ -29,6 +30,7 @@ function App() {
       setLayers(newLayers);
       setHidden(new Set());
     };
+    vp.onDiag = (d) => setDiag(d);
     vp.init()
       .then((ok) => {
         setGpuReady(ok);
@@ -101,6 +103,12 @@ function App() {
         {loaded && (
           <span className="summary">
             {loaded.polygon_count} polys
+          </span>
+        )}
+        {diag && (
+          <span className="summary" title="canvas / msaa / layers / frames / err">
+            {diag.canvasW}×{diag.canvasH} · msaa {diag.msaaW}×{diag.msaaH} · L{diag.layers} · f{diag.frames}
+            {diag.err ? ` · ERR: ${diag.err}` : ""}
           </span>
         )}
       </div>

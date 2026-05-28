@@ -32,6 +32,16 @@ export type LayerInfo = {
   polygon_count: number;
 };
 
+export type Diag = {
+  canvasW: number;
+  canvasH: number;
+  msaaW: number;
+  msaaH: number;
+  layers: number;
+  frames: number;
+  err: string | null;
+};
+
 type GpuLayer = {
   layer: number;
   visible: boolean;
@@ -68,6 +78,8 @@ export class Viewport {
   private destroyed = false;
   /** Called whenever scene metadata changes (after load). */
   public onSceneChanged: ((layers: LayerInfo[]) => void) | null = null;
+  public onDiag: ((d: Diag) => void) | null = null;
+  private diag: Diag = { canvasW: 0, canvasH: 0, msaaW: 0, msaaH: 0, layers: 0, frames: 0, err: null };
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -376,46 +388,65 @@ export class Viewport {
       usage: GPUTextureUsage.RENDER_ATTACHMENT,
     });
     this.msaaView = this.msaaTex.createView();
+    this.diag.msaaW = w;
+    this.diag.msaaH = h;
+  }
+
+  private pushDiag() {
+    this.diag.canvasW = this.canvas.width;
+    this.diag.canvasH = this.canvas.height;
+    this.diag.layers = this.gpuLayers.length;
+    this.onDiag?.({ ...this.diag });
   }
 
   // -- render loop --
 
   private frame = () => {
     if (this.destroyed) return;
-    const tex = this.ctx.getCurrentTexture();
-    const resolveView = tex.createView();
-    const enc = this.device.createCommandEncoder();
-    const pass = enc.beginRenderPass({
-      colorAttachments: [
-        {
-          view: this.msaaView!,
-          resolveTarget: resolveView,
-          loadOp: "clear",
-          storeOp: "discard", // msaa texture is throwaway; only resolve matters
-          clearValue: { r: 0.06, g: 0.06, b: 0.08, a: 1.0 },
-        },
-      ],
-    });
+    try {
+      // If MSAA texture size disagrees with canvas size, the resolve
+      // target dimension check will fail. Re-sync first.
+      if (!this.msaaTex || this.diag.msaaW !== this.canvas.width || this.diag.msaaH !== this.canvas.height) {
+        this.recreateMsaa(this.canvas.width || 1, this.canvas.height || 1);
+      }
+      const tex = this.ctx.getCurrentTexture();
+      const resolveView = tex.createView();
+      const enc = this.device.createCommandEncoder();
+      const pass = enc.beginRenderPass({
+        colorAttachments: [
+          {
+            view: this.msaaView!,
+            resolveTarget: resolveView,
+            loadOp: "clear",
+            storeOp: "store",
+            clearValue: { r: 0.06, g: 0.06, b: 0.08, a: 1.0 },
+          },
+        ],
+      });
 
-    // Fills first, then edges on top so outlines read against the
-    // filled body underneath.
-    pass.setBindGroup(0, this.uniformBg);
-    pass.setPipeline(this.fillPipeline);
-    for (const l of this.gpuLayers) {
-      if (!l.visible || l.triCount === 0) continue;
-      pass.setVertexBuffer(0, l.vbuf);
-      pass.setIndexBuffer(l.tris, "uint32");
-      pass.drawIndexed(l.triCount);
+      pass.setBindGroup(0, this.uniformBg);
+      pass.setPipeline(this.fillPipeline);
+      for (const l of this.gpuLayers) {
+        if (!l.visible || l.triCount === 0) continue;
+        pass.setVertexBuffer(0, l.vbuf);
+        pass.setIndexBuffer(l.tris, "uint32");
+        pass.drawIndexed(l.triCount);
+      }
+      pass.setPipeline(this.edgePipeline);
+      for (const l of this.gpuLayers) {
+        if (!l.visible || l.edgeCount === 0) continue;
+        pass.setVertexBuffer(0, l.vbuf);
+        pass.setIndexBuffer(l.edges, "uint32");
+        pass.drawIndexed(l.edgeCount);
+      }
+      pass.end();
+      this.device.queue.submit([enc.finish()]);
+      this.diag.frames++;
+      if (this.diag.frames % 30 === 1) this.pushDiag();
+    } catch (e) {
+      this.diag.err = String(e);
+      this.pushDiag();
     }
-    pass.setPipeline(this.edgePipeline);
-    for (const l of this.gpuLayers) {
-      if (!l.visible || l.edgeCount === 0) continue;
-      pass.setVertexBuffer(0, l.vbuf);
-      pass.setIndexBuffer(l.edges, "uint32");
-      pass.drawIndexed(l.edgeCount);
-    }
-    pass.end();
-    this.device.queue.submit([enc.finish()]);
     requestAnimationFrame(this.frame);
   };
 }
