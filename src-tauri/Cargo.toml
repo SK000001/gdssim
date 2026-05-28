@@ -1,0 +1,28 @@
+[package]
+name = "gdssim"
+version = "0.1.0"
+description = "Interactive GDS-layout simulator"
+authors = ["TERN"]
+edition = "2021"
+
+[lib]
+name = "gdssim_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Rust-owned GPU viewport window (separate from the Tauri webview).
+# See viewport.rs for the wgpu surface + ortho-2D demo rectangle.
+wgpu = "22"
+winit = "0.30"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
