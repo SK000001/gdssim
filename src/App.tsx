@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { Viewport, type SceneData } from "./viewport";
 import "./App.css";
 
-type LoadGdsResult = {
+type Summary = {
   polygon_count: number;
   layers: number[];
   bbox_min: [number, number];
@@ -11,16 +12,35 @@ type LoadGdsResult = {
 };
 
 function App() {
-  const [pong, setPong] = useState<string>("(not pinged)");
-  const [loaded, setLoaded] = useState<LoadGdsResult | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const viewportRef = useRef<Viewport | null>(null);
+  const [gpuReady, setGpuReady] = useState<boolean | null>(null);
+  const [loaded, setLoaded] = useState<Summary | null>(null);
   const [loadedPath, setLoadedPath] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    invoke<string>("ping")
-      .then(setPong)
-      .catch((e) => setPong(`error: ${e}`));
+    if (!canvasRef.current) return;
+    const vp = new Viewport(canvasRef.current);
+    viewportRef.current = vp;
+    vp.init()
+      .then((ok) => {
+        setGpuReady(ok);
+        if (!ok) {
+          setError(
+            "WebGPU is not available in this WebView2 build. Update Edge/WebView2 runtime."
+          );
+        }
+      })
+      .catch((e) => {
+        setGpuReady(false);
+        setError(`WebGPU init failed: ${e}`);
+      });
+    return () => {
+      vp.destroy();
+      viewportRef.current = null;
+    };
   }, []);
 
   async function pickAndLoad() {
@@ -34,8 +54,14 @@ function App() {
       if (!picked || typeof picked !== "string") return;
       setLoadedPath(picked);
       setLoading(true);
-      const result = await invoke<LoadGdsResult>("load_gds", { path: picked });
-      setLoaded(result);
+      const scene = await invoke<SceneData>("load_gds", { path: picked });
+      viewportRef.current?.loadScene(scene);
+      setLoaded({
+        polygon_count: scene.polygon_count,
+        layers: scene.layers,
+        bbox_min: scene.bbox_min,
+        bbox_max: scene.bbox_max,
+      });
     } catch (e) {
       setError(String(e));
     } finally {
@@ -44,55 +70,43 @@ function App() {
   }
 
   return (
-    <main className="app">
-      <header className="topbar">
-        <button className="primary" onClick={pickAndLoad} disabled={loading}>
+    <div className="root">
+      <canvas ref={canvasRef} className="canvas" />
+
+      <div className="topbar">
+        <button className="primary" onClick={pickAndLoad} disabled={loading || gpuReady === false}>
           {loading ? "Loading…" : "Open .gds file…"}
         </button>
+        <button onClick={() => viewportRef.current?.fitView()} disabled={!loaded}>
+          Fit (F)
+        </button>
         <span className="title">GDSSIM</span>
-        <span className="tag">H2b · viewer + camera</span>
-      </header>
-
-      {loaded && (
-        <section className="panel">
-          <h2>Loaded</h2>
-          <ul>
-            <li>File: <code>{loadedPath}</code></li>
-            <li>Polygons: <code>{loaded.polygon_count}</code></li>
-            <li>Layers: <code>{loaded.layers.join(", ")}</code></li>
-            <li>
-              Bbox: <code>
-                ({loaded.bbox_min[0].toFixed(0)}, {loaded.bbox_min[1].toFixed(0)})
-                – ({loaded.bbox_max[0].toFixed(0)}, {loaded.bbox_max[1].toFixed(0)})
-              </code>
-            </li>
-          </ul>
-        </section>
-      )}
+        <span className="tag">H1.5 · single-window WebGPU</span>
+        <span className="spacer" />
+        {loaded && (
+          <span className="summary">
+            {loaded.polygon_count} polys · layers {loaded.layers.join(", ")}
+          </span>
+        )}
+      </div>
 
       {error && (
-        <section className="panel panel-err">
-          <h2>Error</h2>
+        <div className="overlay overlay-err">
+          <strong>Error</strong>
           <code>{error}</code>
-        </section>
+        </div>
       )}
 
-      {!loaded && !error && (
-        <section className="panel">
-          <h2>Viewport controls</h2>
-          <ul>
-            <li>Mouse wheel — zoom (cursor-anchored)</li>
-            <li>Middle drag — pan</li>
-            <li><code>F</code> — fit to scene</li>
-            <li><code>+ / -</code> — step zoom</li>
-          </ul>
+      {!loaded && !error && gpuReady && (
+        <div className="overlay">
+          <p>Open a <code>.gds</code> file to start.</p>
           <p className="muted">
-            The viewport opens automatically with the app. Pick a <code>.gds</code>
-            file above to load polygons. IPC: <code>{pong}</code>.
+            Mouse wheel = zoom · middle drag = pan · <code>F</code> = fit · <code>+/-</code> = step zoom
           </p>
-        </section>
+          {loadedPath && <p className="muted">Last picked: {loadedPath}</p>}
+        </div>
       )}
-    </main>
+    </div>
   );
 }
 
