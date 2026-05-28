@@ -1,12 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Viewport, type SceneData } from "./viewport";
+import { Viewport, type SceneData, type LayerInfo } from "./viewport";
 import "./App.css";
 
 type Summary = {
   polygon_count: number;
-  layers: number[];
   bbox_min: [number, number];
   bbox_max: [number, number];
 };
@@ -17,6 +16,8 @@ function App() {
   const [gpuReady, setGpuReady] = useState<boolean | null>(null);
   const [loaded, setLoaded] = useState<Summary | null>(null);
   const [loadedPath, setLoadedPath] = useState<string | null>(null);
+  const [layers, setLayers] = useState<LayerInfo[]>([]);
+  const [hidden, setHidden] = useState<Set<number>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -24,6 +25,10 @@ function App() {
     if (!canvasRef.current) return;
     const vp = new Viewport(canvasRef.current);
     viewportRef.current = vp;
+    vp.onSceneChanged = (newLayers) => {
+      setLayers(newLayers);
+      setHidden(new Set());
+    };
     vp.init()
       .then((ok) => {
         setGpuReady(ok);
@@ -43,6 +48,17 @@ function App() {
     };
   }, []);
 
+  const toggleLayer = useCallback(
+    (layer: number) => {
+      const next = new Set(hidden);
+      if (next.has(layer)) next.delete(layer);
+      else next.add(layer);
+      setHidden(next);
+      viewportRef.current?.setLayerVisible(layer, !next.has(layer));
+    },
+    [hidden]
+  );
+
   async function pickAndLoad() {
     setError(null);
     try {
@@ -58,7 +74,6 @@ function App() {
       viewportRef.current?.loadScene(scene);
       setLoaded({
         polygon_count: scene.polygon_count,
-        layers: scene.layers,
         bbox_min: scene.bbox_min,
         bbox_max: scene.bbox_max,
       });
@@ -81,14 +96,38 @@ function App() {
           Fit (F)
         </button>
         <span className="title">GDSSIM</span>
-        <span className="tag">H1.5 · single-window WebGPU</span>
+        <span className="tag">H2c · layers + MSAA + edges</span>
         <span className="spacer" />
         {loaded && (
           <span className="summary">
-            {loaded.polygon_count} polys · layers {loaded.layers.join(", ")}
+            {loaded.polygon_count} polys
           </span>
         )}
       </div>
+
+      {layers.length > 0 && (
+        <div className="layerpanel">
+          <div className="lp-hd">Layers</div>
+          {layers.map((l) => {
+            const visible = !hidden.has(l.layer);
+            const rgb = `rgb(${Math.round(l.color[0] * 255)}, ${Math.round(l.color[1] * 255)}, ${Math.round(l.color[2] * 255)})`;
+            return (
+              <label
+                key={l.layer}
+                className={"lp-row" + (visible ? "" : " off")}
+                onClick={(e) => {
+                  e.preventDefault();
+                  toggleLayer(l.layer);
+                }}
+              >
+                <span className="lp-sw" style={{ background: rgb }} />
+                <span className="lp-num">L{l.layer}</span>
+                <span className="lp-count">{l.polygon_count}</span>
+              </label>
+            );
+          })}
+        </div>
+      )}
 
       {error && (
         <div className="overlay overlay-err">

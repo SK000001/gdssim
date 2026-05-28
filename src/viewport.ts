@@ -1,57 +1,80 @@
-// WebGPU viewport: render the polygons returned by `load_gds` into a
-// <canvas> in the Tauri webview. Replaces the old Rust-owned winit
-// window. Rust still does parsing / hierarchy flatten / triangulation;
-// this file just owns the GPU buffers + camera + input.
+// WebGPU viewport: renders polygons returned by `load_gds` into a
+// <canvas>. Rust does parsing/flatten/triangulation; this file owns
+// the GPU pipeline + camera + input.
+//
+// H2c: scene split per layer so visibility toggles map to draw-call
+// skips. Two pipelines per layer: a fill (triangle-list) and an edge
+// (line-list, brighter colour) so thin features stay visible even
+// when they drop sub-pixel at low zoom. 4× MSAA on the colour target
+// kills the jaggies on diagonal waveguide S-bends.
 
 import shaderSrc from "./viewport.wgsl?raw";
 
+export type LayerData = {
+  layer: number;
+  color: [number, number, number];
+  polygon_count: number;
+  vertices: number[];
+  triangle_indices: number[];
+  edge_indices: number[];
+};
+
 export type SceneData = {
   polygon_count: number;
-  layers: number[];
   bbox_min: [number, number];
   bbox_max: [number, number];
-  vertices: number[]; // interleaved x, y, r, g, b
-  indices: number[];
+  layers: LayerData[];
 };
 
-type Camera = {
-  center: [number, number];
-  halfH: number;
-  bbox: { min: [number, number]; max: [number, number] };
+export type LayerInfo = {
+  layer: number;
+  color: [number, number, number];
+  polygon_count: number;
 };
 
-const VERTEX_FLOATS = 5; // x, y, r, g, b
+type GpuLayer = {
+  layer: number;
+  visible: boolean;
+  vbuf: GPUBuffer;
+  tris: GPUBuffer;
+  triCount: number;
+  edges: GPUBuffer;
+  edgeCount: number;
+};
+
+const VERTEX_FLOATS = 5;
+const MSAA_SAMPLES = 4;
 
 export class Viewport {
   private canvas: HTMLCanvasElement;
   private device!: GPUDevice;
   private ctx!: GPUCanvasContext;
   private format!: GPUTextureFormat;
-  private pipeline!: GPURenderPipeline;
+  private fillPipeline!: GPURenderPipeline;
+  private edgePipeline!: GPURenderPipeline;
   private uniformBuf!: GPUBuffer;
   private uniformBg!: GPUBindGroup;
-  private vbuf: GPUBuffer | null = null;
-  private ibuf: GPUBuffer | null = null;
-  private indexCount = 0;
-  private cam: Camera = {
-    center: [0, 0],
+  private msaaTex: GPUTexture | null = null;
+  private msaaView: GPUTextureView | null = null;
+  private gpuLayers: GpuLayer[] = [];
+  private cam = {
+    center: [0, 0] as [number, number],
     halfH: 150,
-    bbox: { min: [0, 0], max: [0, 0] },
+    bbox: { min: [0, 0] as [number, number], max: [0, 0] as [number, number] },
   };
   private cursor: [number, number] = [0, 0];
   private panning = false;
   private panLast: [number, number] = [0, 0];
   private destroyed = false;
+  /** Called whenever scene metadata changes (after load). */
+  public onSceneChanged: ((layers: LayerInfo[]) => void) | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
   }
 
-  /** Returns true on success, false if WebGPU isn't available. */
   async init(): Promise<boolean> {
-    if (!("gpu" in navigator)) {
-      return false;
-    }
+    if (!("gpu" in navigator)) return false;
     const adapter = await navigator.gpu.requestAdapter();
     if (!adapter) return false;
     this.device = await adapter.requestDevice();
@@ -82,33 +105,50 @@ export class Viewport {
       size: 64, // mat4x4<f32>
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-
     this.uniformBg = this.device.createBindGroup({
       layout: bgLayout,
       entries: [{ binding: 0, resource: { buffer: this.uniformBuf } }],
     });
 
-    this.pipeline = this.device.createRenderPipeline({
-      layout: this.device.createPipelineLayout({ bindGroupLayouts: [bgLayout] }),
-      vertex: {
-        module: shader,
-        entryPoint: "vs_main",
-        buffers: [
-          {
-            arrayStride: VERTEX_FLOATS * 4,
-            attributes: [
-              { shaderLocation: 0, offset: 0, format: "float32x2" },
-              { shaderLocation: 1, offset: 8, format: "float32x3" },
-            ],
-          },
-        ],
-      },
+    const pipelineLayout = this.device.createPipelineLayout({
+      bindGroupLayouts: [bgLayout],
+    });
+    const vertexState: GPUVertexState = {
+      module: shader,
+      entryPoint: "vs_main",
+      buffers: [
+        {
+          arrayStride: VERTEX_FLOATS * 4,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: "float32x2" },
+            { shaderLocation: 1, offset: 8, format: "float32x3" },
+          ],
+        },
+      ],
+    };
+
+    this.fillPipeline = this.device.createRenderPipeline({
+      layout: pipelineLayout,
+      vertex: vertexState,
       fragment: {
         module: shader,
-        entryPoint: "fs_main",
+        entryPoint: "fs_fill",
         targets: [{ format: this.format }],
       },
       primitive: { topology: "triangle-list", frontFace: "ccw" },
+      multisample: { count: MSAA_SAMPLES },
+    });
+
+    this.edgePipeline = this.device.createRenderPipeline({
+      layout: pipelineLayout,
+      vertex: vertexState,
+      fragment: {
+        module: shader,
+        entryPoint: "fs_edge",
+        targets: [{ format: this.format }],
+      },
+      primitive: { topology: "line-list" },
+      multisample: { count: MSAA_SAMPLES },
     });
 
     this.attachInput();
@@ -121,36 +161,77 @@ export class Viewport {
 
   destroy() {
     this.destroyed = true;
+    this.releaseLayerBuffers();
+    this.msaaTex?.destroy();
+    this.msaaTex = null;
+    this.msaaView = null;
+  }
+
+  private releaseLayerBuffers() {
+    for (const l of this.gpuLayers) {
+      l.vbuf.destroy();
+      l.tris.destroy();
+      l.edges.destroy();
+    }
+    this.gpuLayers = [];
   }
 
   loadScene(s: SceneData) {
-    if (s.indices.length === 0) {
-      this.vbuf = null;
-      this.ibuf = null;
-      this.indexCount = 0;
-      return;
+    this.releaseLayerBuffers();
+    for (const ld of s.layers) {
+      if (ld.vertices.length === 0) continue;
+      const verts = new Float32Array(ld.vertices);
+      const tris = new Uint32Array(ld.triangle_indices);
+      const edges = new Uint32Array(ld.edge_indices);
+
+      const vbuf = this.device.createBuffer({
+        size: verts.byteLength,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      });
+      this.device.queue.writeBuffer(vbuf, 0, verts);
+
+      const tribuf = this.device.createBuffer({
+        size: tris.byteLength || 4,
+        usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+      });
+      if (tris.byteLength > 0) this.device.queue.writeBuffer(tribuf, 0, tris);
+
+      const edgebuf = this.device.createBuffer({
+        size: edges.byteLength || 4,
+        usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+      });
+      if (edges.byteLength > 0) this.device.queue.writeBuffer(edgebuf, 0, edges);
+
+      this.gpuLayers.push({
+        layer: ld.layer,
+        visible: true,
+        vbuf,
+        tris: tribuf,
+        triCount: tris.length,
+        edges: edgebuf,
+        edgeCount: edges.length,
+      });
     }
-    const verts = new Float32Array(s.vertices);
-    const indices = new Uint32Array(s.indices);
-
-    if (this.vbuf) this.vbuf.destroy();
-    if (this.ibuf) this.ibuf.destroy();
-
-    this.vbuf = this.device.createBuffer({
-      size: verts.byteLength,
-      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(this.vbuf, 0, verts);
-
-    this.ibuf = this.device.createBuffer({
-      size: indices.byteLength,
-      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(this.ibuf, 0, indices);
-
-    this.indexCount = indices.length;
     this.cam.bbox = { min: s.bbox_min, max: s.bbox_max };
     this.fitView();
+    this.onSceneChanged?.(this.layerInfos(s));
+  }
+
+  layers(): number[] {
+    return this.gpuLayers.map((l) => l.layer);
+  }
+
+  private layerInfos(s: SceneData): LayerInfo[] {
+    return s.layers.map((l) => ({
+      layer: l.layer,
+      color: l.color,
+      polygon_count: l.polygon_count,
+    }));
+  }
+
+  setLayerVisible(layer: number, visible: boolean) {
+    const l = this.gpuLayers.find((x) => x.layer === layer);
+    if (l) l.visible = visible;
   }
 
   // -- camera math (mirrors viewport.rs's pre-H1.5 helpers) --
@@ -190,7 +271,7 @@ export class Viewport {
     const dwx = (dx / w) * 2 * this.halfW();
     const dwy = (dy / h) * 2 * this.cam.halfH;
     this.cam.center[0] -= dwx;
-    this.cam.center[1] += dwy; // pixel-y down ↔ world-y up
+    this.cam.center[1] += dwy;
     this.writeProj();
   }
 
@@ -217,7 +298,6 @@ export class Viewport {
     const bottom = cy - hh, top = cy + hh;
     const rl = right - left;
     const tb = top - bottom;
-    // Column-major mat4x4<f32> — same layout the Rust helper used.
     const m = new Float32Array([
        2 / rl,            0,                  0, 0,
        0,                 2 / tb,             0, 0,
@@ -231,7 +311,7 @@ export class Viewport {
 
   private attachInput() {
     const c = this.canvas;
-    c.tabIndex = 0; // accept keyboard focus
+    c.tabIndex = 0;
     c.addEventListener("mousemove", (e) => {
       const r = c.getBoundingClientRect();
       const p: [number, number] = [
@@ -246,7 +326,6 @@ export class Viewport {
     });
     c.addEventListener("mousedown", (e) => {
       if (e.button === 1) {
-        // Middle button.
         e.preventDefault();
         this.panning = true;
         this.panLast = this.cursor;
@@ -281,8 +360,22 @@ export class Viewport {
     if (this.canvas.width !== w || this.canvas.height !== h) {
       this.canvas.width = w;
       this.canvas.height = h;
+      this.recreateMsaa(w, h);
       this.writeProj();
+    } else if (!this.msaaTex) {
+      this.recreateMsaa(w, h);
     }
+  }
+
+  private recreateMsaa(w: number, h: number) {
+    this.msaaTex?.destroy();
+    this.msaaTex = this.device.createTexture({
+      size: [w, h],
+      sampleCount: MSAA_SAMPLES,
+      format: this.format,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    this.msaaView = this.msaaTex.createView();
   }
 
   // -- render loop --
@@ -290,23 +383,36 @@ export class Viewport {
   private frame = () => {
     if (this.destroyed) return;
     const tex = this.ctx.getCurrentTexture();
+    const resolveView = tex.createView();
     const enc = this.device.createCommandEncoder();
     const pass = enc.beginRenderPass({
       colorAttachments: [
         {
-          view: tex.createView(),
+          view: this.msaaView!,
+          resolveTarget: resolveView,
           loadOp: "clear",
-          storeOp: "store",
+          storeOp: "discard", // msaa texture is throwaway; only resolve matters
           clearValue: { r: 0.06, g: 0.06, b: 0.08, a: 1.0 },
         },
       ],
     });
-    if (this.vbuf && this.ibuf && this.indexCount > 0) {
-      pass.setPipeline(this.pipeline);
-      pass.setBindGroup(0, this.uniformBg);
-      pass.setVertexBuffer(0, this.vbuf);
-      pass.setIndexBuffer(this.ibuf, "uint32");
-      pass.drawIndexed(this.indexCount);
+
+    // Fills first, then edges on top so outlines read against the
+    // filled body underneath.
+    pass.setBindGroup(0, this.uniformBg);
+    pass.setPipeline(this.fillPipeline);
+    for (const l of this.gpuLayers) {
+      if (!l.visible || l.triCount === 0) continue;
+      pass.setVertexBuffer(0, l.vbuf);
+      pass.setIndexBuffer(l.tris, "uint32");
+      pass.drawIndexed(l.triCount);
+    }
+    pass.setPipeline(this.edgePipeline);
+    for (const l of this.gpuLayers) {
+      if (!l.visible || l.edgeCount === 0) continue;
+      pass.setVertexBuffer(0, l.vbuf);
+      pass.setIndexBuffer(l.edges, "uint32");
+      pass.drawIndexed(l.edgeCount);
     }
     pass.end();
     this.device.queue.submit([enc.finish()]);
