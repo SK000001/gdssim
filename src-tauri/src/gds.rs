@@ -58,9 +58,62 @@ pub enum GdsError {
 
 /// Load `path` and return all polygons of the top cell, with the
 /// hierarchy flattened.
+///
+/// Real-world GDS files (especially gdsfactory output) sometimes
+/// carry zero / out-of-range Y/M/D fields in BGNLIB and BGNSTR.
+/// gds21 hands those to `chrono::NaiveDate::from_ymd_opt(...).unwrap()`
+/// which panics. We patch those record bodies to a safe sentinel date
+/// (1980-01-01 00:00:00) before parsing — gds21 only uses the dates
+/// for library metadata, which we discard anyway.
 pub fn load_and_flatten(path: &Path) -> Result<Vec<Polygon>, GdsError> {
-    let lib = GdsLibrary::load(path).map_err(|e| GdsError::Parse(format!("{e:?}")))?;
+    let bytes = std::fs::read(path).map_err(|e| GdsError::Parse(format!("read: {e}")))?;
+    let patched = sanitize_dates(&bytes);
+    let tmp = tempfile::Builder::new()
+        .prefix("gdssim-sanitized-")
+        .suffix(".gds")
+        .tempfile()
+        .map_err(|e| GdsError::Parse(format!("tempfile: {e}")))?;
+    std::fs::write(tmp.path(), &patched)
+        .map_err(|e| GdsError::Parse(format!("tempfile write: {e}")))?;
+    let lib = GdsLibrary::load(tmp.path()).map_err(|e| GdsError::Parse(format!("{e:?}")))?;
     flatten_library(&lib)
+}
+
+/// Walk the GDS record stream and overwrite the 12 i16 date words of
+/// every BGNLIB (record 0x01) and BGNSTR (record 0x05) with
+/// 1980-01-01 00:00:00.
+///
+/// GDS record format: `[u16 BE length][u8 rec_type][u8 data_type][data…]`.
+/// `length` includes the 4-byte header. We only mutate the data block.
+fn sanitize_dates(input: &[u8]) -> Vec<u8> {
+    const REC_BGNLIB: u8 = 0x01;
+    const REC_BGNSTR: u8 = 0x05;
+    // Two dates, Y/M/D/h/m/s each, as i16 BE.
+    const SAFE_DATE_BYTES: [u8; 24] = [
+        0x07, 0xBC, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x07, 0xBC, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    let mut out = input.to_vec();
+    let mut i = 0;
+    while i + 4 <= out.len() {
+        let len = u16::from_be_bytes([out[i], out[i + 1]]) as usize;
+        if len < 4 || i + len > out.len() {
+            break; // malformed; bail without further mutation
+        }
+        let rec_type = out[i + 2];
+        if rec_type == REC_BGNLIB || rec_type == REC_BGNSTR {
+            let body_start = i + 4;
+            let body_end = i + len;
+            let body_len = body_end - body_start;
+            if body_len >= SAFE_DATE_BYTES.len() {
+                out[body_start..body_start + SAFE_DATE_BYTES.len()]
+                    .copy_from_slice(&SAFE_DATE_BYTES);
+            }
+        }
+        i += len;
+    }
+    out
 }
 
 /// Like [`load_and_flatten`] but starts from a pre-parsed library.
@@ -275,6 +328,37 @@ mod tests {
             structs: vec![child, top],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn sanitize_dates_replaces_bgnlib_and_bgnstr_bodies() {
+        // Craft a minimal stream: BGNLIB(year=0) + BGNSTR(year=99999&0xFFFF) +
+        // an unrelated record we shouldn't touch.
+        let mut buf = Vec::new();
+        // BGNLIB: length=28, rec=0x01, dtype=0x02, 12 i16 (all zero → would panic chrono).
+        buf.extend_from_slice(&28u16.to_be_bytes());
+        buf.push(0x01);
+        buf.push(0x02);
+        buf.extend_from_slice(&[0u8; 24]);
+        // BGNSTR: same shape, year=9999 (still out of typical range).
+        buf.extend_from_slice(&28u16.to_be_bytes());
+        buf.push(0x05);
+        buf.push(0x02);
+        buf.extend_from_slice(&9999i16.to_be_bytes());
+        buf.extend_from_slice(&[0u8; 22]);
+        // Untouched record: STRNAME (rec=0x06, dtype=0x06 ASCII), 4 chars.
+        buf.extend_from_slice(&8u16.to_be_bytes());
+        buf.push(0x06);
+        buf.push(0x06);
+        buf.extend_from_slice(b"TOP_");
+
+        let out = sanitize_dates(&buf);
+        // BGNLIB body now starts with year=1980 (0x07BC).
+        assert_eq!(&out[4..6], &[0x07, 0xBC]);
+        // BGNSTR body also patched.
+        assert_eq!(&out[32..34], &[0x07, 0xBC]);
+        // STRNAME unchanged.
+        assert_eq!(&out[60..64], b"TOP_");
     }
 
     #[test]
