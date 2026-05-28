@@ -1,25 +1,31 @@
 //! Rust-owned wgpu viewport window.
 //!
 //! Tauri's webview can't host a `wgpu::Surface` directly, so we open a
-//! second native window (via `winit`) and paint it with wgpu. This module
-//! is the H1 proof of life: clear-color + one rectangle drawn in world
-//! coordinates through an orthographic projection — the same pattern
-//! GDS-layer polygons will use.
+//! second native window (via `winit`) on a dedicated thread and paint it
+//! with wgpu.
 //!
-//! Called from `lib.rs` via the `open_viewport` Tauri command, which
-//! spawns a dedicated thread so the winit event loop doesn't block
-//! the Tauri main thread.
+//! Talks to the rest of the app through one `winit` user event,
+//! [`UserEvent::LoadScene`], sent via [`EventLoopProxy::send_event`].
+//! The proxy is stashed in [`VIEWPORT_PROXY`] when the viewport thread
+//! starts, so Tauri command handlers (on a different thread) can push
+//! scenes in.
+//!
+//! H2a: replaced the hardcoded rectangle with polygons loaded from a
+//! `.gds` file. Polygons are ear-clipped into triangles and coloured
+//! by layer; the ortho projection fits the loaded bbox.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
-    event_loop::{ActiveEventLoop, EventLoop},
+    event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy},
     window::{Window, WindowId},
 };
+
+use crate::gds::{self, Polygon};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -41,21 +47,9 @@ impl Vertex {
     }
 }
 
-// World coordinates: a 200×120 rectangle centred at (0, 0).
-// The ortho projection in the shader maps world units → clip space, so
-// this is "real" geometry, not screen-space.
-const RECT: &[Vertex] = &[
-    Vertex { pos: [-100.0, -60.0], color: [0.85, 0.30, 0.30] },
-    Vertex { pos: [ 100.0, -60.0], color: [0.30, 0.85, 0.30] },
-    Vertex { pos: [ 100.0,  60.0], color: [0.30, 0.30, 0.85] },
-    Vertex { pos: [-100.0,  60.0], color: [0.85, 0.85, 0.30] },
-];
-const INDICES: &[u16] = &[0, 1, 2, 0, 2, 3];
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 struct Uniforms {
-    // column-major 4×4 ortho matrix
     proj: [[f32; 4]; 4],
 }
 
@@ -70,16 +64,90 @@ fn ortho(left: f32, right: f32, bottom: f32, top: f32) -> [[f32; 4]; 4] {
     ]
 }
 
+/// Deterministic colour per GDS layer. H2c will replace this with a
+/// proper technology-file map.
+fn layer_color(layer: i16) -> [f32; 3] {
+    // Small palette for the typical 0..7 process layers, then a
+    // hash-based fallback so unknown layers still render distinctly.
+    const PALETTE: [[f32; 3]; 8] = [
+        [0.55, 0.55, 0.55], // 0  background-ish
+        [0.45, 0.85, 0.40], // 1  poly (green)
+        [0.30, 0.55, 0.95], // 2  active/diff (blue)
+        [0.95, 0.85, 0.30], // 3  contact (yellow)
+        [0.90, 0.40, 0.40], // 4  metal1 (red)
+        [0.40, 0.85, 0.85], // 5  metal2 (cyan)
+        [0.85, 0.50, 0.85], // 6  metal3 (magenta)
+        [0.95, 0.65, 0.30], // 7  via (orange)
+    ];
+    if (0..PALETTE.len() as i16).contains(&layer) {
+        return PALETTE[layer as usize];
+    }
+    // FNV-ish hash to a pastel.
+    let h = (layer as i32 as u32).wrapping_mul(2654435761);
+    let r = ((h >> 16) & 0xff) as f32 / 255.0;
+    let g = ((h >> 8) & 0xff) as f32 / 255.0;
+    let b = (h & 0xff) as f32 / 255.0;
+    [0.4 + 0.5 * r, 0.4 + 0.5 * g, 0.4 + 0.5 * b]
+}
+
+/// Triangulate one polygon (no holes for now) into vertex+index buffers.
+fn tessellate(poly: &Polygon, verts: &mut Vec<Vertex>, indices: &mut Vec<u32>) {
+    if poly.points.len() < 3 {
+        return;
+    }
+    // Flatten coords for earcutr.
+    let mut flat: Vec<f64> = Vec::with_capacity(poly.points.len() * 2);
+    for p in &poly.points {
+        flat.push(p[0]);
+        flat.push(p[1]);
+    }
+    let Ok(tris) = earcutr::earcut(&flat, &[], 2) else {
+        log::warn!("earcut failed on polygon with {} pts", poly.points.len());
+        return;
+    };
+    let base = verts.len() as u32;
+    let color = layer_color(poly.layer);
+    for p in &poly.points {
+        verts.push(Vertex { pos: [p[0] as f32, p[1] as f32], color });
+    }
+    for i in tris {
+        indices.push(base + i as u32);
+    }
+}
+
+struct Scene {
+    verts: Vec<Vertex>,
+    indices: Vec<u32>,
+    bbox: gds::Bbox,
+}
+
+impl Scene {
+    fn from_polygons(polys: &[Polygon]) -> Self {
+        let bbox = gds::bbox(polys);
+        let mut verts = Vec::new();
+        let mut indices = Vec::new();
+        for p in polys {
+            tessellate(p, &mut verts, &mut indices);
+        }
+        Self { verts, indices, bbox }
+    }
+}
+
 struct GpuState {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
-    vertex_buf: wgpu::Buffer,
-    index_buf: wgpu::Buffer,
     uniform_buf: wgpu::Buffer,
     uniform_bg: wgpu::BindGroup,
+    /// Latest uploaded scene. None until first LoadScene.
+    scene_buffers: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
+    /// World-space view: half-width and half-height around `view_center`.
+    view_center: [f32; 2],
+    view_half_h: f32,
+    /// Cached bbox of the loaded scene (used by fit / reset).
+    scene_bbox: gds::Bbox,
     window: Arc<Window>,
 }
 
@@ -136,8 +204,11 @@ impl GpuState {
             source: wgpu::ShaderSource::Wgsl(include_str!("viewport.wgsl").into()),
         });
 
+        // Default world view: 400×300 centred on origin until a scene loads.
+        let view_center = [0.0_f32, 0.0_f32];
+        let view_half_h = 150.0_f32;
         let uniforms = Uniforms {
-            proj: ortho_for_size(size.width as f32, size.height as f32),
+            proj: ortho_for_view(view_center, view_half_h, size.width as f32, size.height as f32),
         };
         let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("gdssim-uniform-buf"),
@@ -208,29 +279,74 @@ impl GpuState {
             cache: None,
         });
 
-        let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("gdssim-vbuf"),
-            contents: bytemuck::cast_slice(RECT),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("gdssim-ibuf"),
-            contents: bytemuck::cast_slice(INDICES),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-
         Self {
             surface,
             device,
             queue,
             config,
             pipeline,
-            vertex_buf,
-            index_buf,
             uniform_buf,
             uniform_bg,
+            scene_buffers: None,
+            view_center,
+            view_half_h,
+            scene_bbox: gds::Bbox { min: [0.0; 2], max: [0.0; 2] },
             window,
         }
+    }
+
+    fn upload_scene(&mut self, scene: Scene) {
+        if scene.indices.is_empty() {
+            self.scene_buffers = None;
+            return;
+        }
+        let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("gdssim-scene-vbuf"),
+            contents: bytemuck::cast_slice(&scene.verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("gdssim-scene-ibuf"),
+            contents: bytemuck::cast_slice(&scene.indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let n = scene.indices.len() as u32;
+        self.scene_buffers = Some((vbuf, ibuf, n));
+        self.scene_bbox = scene.bbox;
+        self.fit_view();
+    }
+
+    /// Centre + zoom the view to fit the loaded scene bbox with 10% pad.
+    fn fit_view(&mut self) {
+        let b = self.scene_bbox;
+        if b.min[0] >= b.max[0] || b.min[1] >= b.max[1] {
+            return;
+        }
+        let cx = ((b.min[0] + b.max[0]) * 0.5) as f32;
+        let cy = ((b.min[1] + b.max[1]) * 0.5) as f32;
+        let w = (b.max[0] - b.min[0]) as f32;
+        let h = (b.max[1] - b.min[1]) as f32;
+        let aspect = if self.config.height > 0 {
+            self.config.width as f32 / self.config.height as f32
+        } else { 1.0 };
+        // We want half_h to be at least h/2 and at least (w/aspect)/2.
+        let half_h = (h * 0.5).max((w / aspect.max(1e-6)) * 0.5) * 1.1; // 10% pad
+        self.view_center = [cx, cy];
+        self.view_half_h = half_h.max(1.0);
+        self.write_proj();
+    }
+
+    fn write_proj(&self) {
+        let uniforms = Uniforms {
+            proj: ortho_for_view(
+                self.view_center,
+                self.view_half_h,
+                self.config.width as f32,
+                self.config.height as f32,
+            ),
+        };
+        self.queue
+            .write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[uniforms]));
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -240,11 +356,7 @@ impl GpuState {
         self.config.width = w;
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
-        let uniforms = Uniforms {
-            proj: ortho_for_size(w as f32, h as f32),
-        };
-        self.queue
-            .write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&[uniforms]));
+        self.write_proj();
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -277,11 +389,13 @@ impl GpuState {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.uniform_bg, &[]);
-            pass.set_vertex_buffer(0, self.vertex_buf.slice(..));
-            pass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
-            pass.draw_indexed(0..INDICES.len() as u32, 0, 0..1);
+            if let Some((vbuf, ibuf, n)) = &self.scene_buffers {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.uniform_bg, &[]);
+                pass.set_vertex_buffer(0, vbuf.slice(..));
+                pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..*n, 0, 0..1);
+            }
         }
         self.queue.submit(std::iter::once(enc.finish()));
         frame.present();
@@ -289,21 +403,26 @@ impl GpuState {
     }
 }
 
-/// Build an ortho matrix that shows a 400×300 world rect centred on origin,
-/// preserving aspect ratio of the surface.
-fn ortho_for_size(w: f32, h: f32) -> [[f32; 4]; 4] {
-    let target_h: f32 = 300.0;
+/// Build an ortho matrix centred on `center` with the given world
+/// half-height, aspect-corrected for the current surface.
+fn ortho_for_view(center: [f32; 2], half_h: f32, w: f32, h: f32) -> [[f32; 4]; 4] {
     let aspect = if h > 0.0 { w / h } else { 1.0 };
-    let half_h = target_h * 0.5;
-    let half_w = half_h * aspect;
-    ortho(-half_w, half_w, -half_h, half_h)
+    let hh = half_h.max(1e-3);
+    let hw = hh * aspect;
+    ortho(center[0] - hw, center[0] + hw, center[1] - hh, center[1] + hh)
+}
+
+#[derive(Debug)]
+pub enum UserEvent {
+    LoadScene(Vec<Polygon>),
 }
 
 struct App {
     state: Option<GpuState>,
+    pending_scene: Option<Vec<Polygon>>,
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
@@ -316,8 +435,25 @@ impl ApplicationHandler for App {
                 .create_window(attrs)
                 .expect("create viewport window"),
         );
-        let state = pollster::block_on(GpuState::new(window));
+        let mut state = pollster::block_on(GpuState::new(window));
+        if let Some(polys) = self.pending_scene.take() {
+            state.upload_scene(Scene::from_polygons(&polys));
+        }
         self.state = Some(state);
+    }
+
+    fn user_event(&mut self, _el: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::LoadScene(polys) => match self.state.as_mut() {
+                Some(state) => {
+                    state.upload_scene(Scene::from_polygons(&polys));
+                    state.window.request_redraw();
+                }
+                None => {
+                    self.pending_scene = Some(polys);
+                }
+            },
+        }
     }
 
     fn window_event(
@@ -346,24 +482,53 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Set once when the viewport thread starts; used by Tauri command
+/// handlers (on a separate thread) to push scenes into the event loop.
+pub static VIEWPORT_PROXY: OnceLock<Mutex<Option<EventLoopProxy<UserEvent>>>> = OnceLock::new();
+
 /// Open the viewport window on a dedicated OS thread.
 /// Returns immediately; the window keeps running until the user closes it.
 pub fn spawn() -> Result<(), String> {
+    let slot = VIEWPORT_PROXY.get_or_init(|| Mutex::new(None));
+    {
+        let guard = slot.lock().unwrap();
+        if guard.is_some() {
+            return Err("viewport already open".into());
+        }
+    }
     std::thread::Builder::new()
         .name("gdssim-viewport".into())
         .spawn(|| {
-            let event_loop = match EventLoop::new() {
+            let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
                 Ok(el) => el,
                 Err(e) => {
                     log::error!("event loop init failed: {e:?}");
                     return;
                 }
             };
-            let mut app = App { state: None };
+            let proxy = event_loop.create_proxy();
+            if let Some(slot) = VIEWPORT_PROXY.get() {
+                *slot.lock().unwrap() = Some(proxy);
+            }
+            let mut app = App { state: None, pending_scene: None };
             if let Err(e) = event_loop.run_app(&mut app) {
                 log::error!("event loop exited with error: {e:?}");
+            }
+            // Window closed; clear the proxy so the user can reopen.
+            if let Some(slot) = VIEWPORT_PROXY.get() {
+                *slot.lock().unwrap() = None;
             }
         })
         .map_err(|e| format!("spawn viewport thread: {e}"))?;
     Ok(())
+}
+
+/// Push a parsed polygon set to the running viewport.
+pub fn send_scene(polys: Vec<Polygon>) -> Result<(), String> {
+    let slot = VIEWPORT_PROXY.get().ok_or("viewport not started")?;
+    let guard = slot.lock().unwrap();
+    let proxy = guard.as_ref().ok_or("viewport not started")?;
+    proxy
+        .send_event(UserEvent::LoadScene(polys))
+        .map_err(|_| "viewport event loop closed".to_string())
 }
