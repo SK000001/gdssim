@@ -14,7 +14,7 @@
 //! `.gds` file. Polygons are ear-clipped into triangles and coloured
 //! by layer; the ortho projection fits the loaded bbox.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
@@ -470,6 +470,9 @@ fn ortho_for_view(center: [f32; 2], half_h: f32, w: f32, h: f32) -> [[f32; 4]; 4
 
 #[derive(Debug)]
 pub enum UserEvent {
+    /// Create the viewport window (if not already shown).
+    ShowWindow,
+    /// Replace the rendered scene with these polygons.
     LoadScene(Vec<Polygon>),
 }
 
@@ -478,9 +481,13 @@ struct App {
     pending_scene: Option<Vec<Polygon>>,
 }
 
-impl ApplicationHandler<UserEvent> for App {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+impl App {
+    fn create_window(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
+            // Already shown — bring it forward.
+            if let Some(state) = self.state.as_ref() {
+                state.window.focus_window();
+            }
             return;
         }
         let attrs = Window::default_attributes()
@@ -497,9 +504,18 @@ impl ApplicationHandler<UserEvent> for App {
         }
         self.state = Some(state);
     }
+}
 
-    fn user_event(&mut self, _el: &ActiveEventLoop, event: UserEvent) {
+impl ApplicationHandler<UserEvent> for App {
+    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {
+        // No-op. The window is created on demand via UserEvent::ShowWindow
+        // so that closing it doesn't tear down the event loop (winit on
+        // Windows refuses to rebuild an EventLoop in the same process).
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
+            UserEvent::ShowWindow => self.create_window(event_loop),
             UserEvent::LoadScene(polys) => match self.state.as_mut() {
                 Some(state) => {
                     state.upload_scene(Scene::from_polygons(&polys));
@@ -514,13 +530,18 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn window_event(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        _event_loop: &ActiveEventLoop,
         _id: WindowId,
         event: WindowEvent,
     ) {
         let Some(state) = self.state.as_mut() else { return };
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // Drop the window + GpuState; keep the event loop alive
+                // so the user can reopen the viewport without restarting.
+                self.state = None;
+                return;
+            }
             WindowEvent::Resized(size) => state.resize(size.width, size.height),
             WindowEvent::CursorMoved { position, .. } => {
                 let p = [position.x as f32, position.y as f32];
@@ -583,23 +604,27 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
-/// Set once when the viewport thread starts; used by Tauri command
-/// handlers (on a separate thread) to push scenes into the event loop.
+/// Proxy to the viewport thread's event loop. Set once by [`init`]
+/// at app startup; never cleared. winit refuses to rebuild an
+/// `EventLoop` on Windows, so we keep one alive for the process
+/// lifetime and toggle the window via `UserEvent::ShowWindow`.
 pub static VIEWPORT_PROXY: OnceLock<Mutex<Option<EventLoopProxy<UserEvent>>>> = OnceLock::new();
 
-/// Open the viewport window on a dedicated OS thread.
-/// Returns immediately; the window keeps running until the user closes it.
-pub fn spawn() -> Result<(), String> {
+/// Spawn the viewport thread (idempotent). Blocks the caller until
+/// the event loop has registered its proxy, so subsequent `show()` /
+/// `send_scene()` calls are guaranteed to find one.
+pub fn init() -> Result<(), String> {
     let slot = VIEWPORT_PROXY.get_or_init(|| Mutex::new(None));
     {
         let guard = slot.lock().unwrap();
         if guard.is_some() {
-            return Err("viewport already open".into());
+            return Ok(()); // already running
         }
     }
+    let (tx, rx) = mpsc::sync_channel::<EventLoopProxy<UserEvent>>(0);
     std::thread::Builder::new()
         .name("gdssim-viewport".into())
-        .spawn(|| {
+        .spawn(move || {
             // Tauri owns the main thread, so the viewport's winit event
             // loop has to opt in to running on a worker. Windows + X11
             // expose this; macOS hard-requires the main thread (a later
@@ -622,29 +647,36 @@ pub fn spawn() -> Result<(), String> {
                     return;
                 }
             };
-            let proxy = event_loop.create_proxy();
-            if let Some(slot) = VIEWPORT_PROXY.get() {
-                *slot.lock().unwrap() = Some(proxy);
-            }
+            let _ = tx.send(event_loop.create_proxy());
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
             let mut app = App { state: None, pending_scene: None };
             if let Err(e) = event_loop.run_app(&mut app) {
                 log::error!("event loop exited with error: {e:?}");
             }
-            // Window closed; clear the proxy so the user can reopen.
-            if let Some(slot) = VIEWPORT_PROXY.get() {
-                *slot.lock().unwrap() = None;
-            }
         })
         .map_err(|e| format!("spawn viewport thread: {e}"))?;
+    let proxy = rx
+        .recv()
+        .map_err(|_| "viewport thread died before registering proxy".to_string())?;
+    *slot.lock().unwrap() = Some(proxy);
     Ok(())
+}
+
+fn with_proxy<R>(f: impl FnOnce(&EventLoopProxy<UserEvent>) -> R) -> Result<R, String> {
+    let slot = VIEWPORT_PROXY.get().ok_or("viewport not initialised")?;
+    let guard = slot.lock().unwrap();
+    let proxy = guard.as_ref().ok_or("viewport not initialised")?;
+    Ok(f(proxy))
+}
+
+/// Show the viewport window (creates it if hidden / closed).
+pub fn show() -> Result<(), String> {
+    with_proxy(|p| p.send_event(UserEvent::ShowWindow))?
+        .map_err(|_| "viewport event loop closed".to_string())
 }
 
 /// Push a parsed polygon set to the running viewport.
 pub fn send_scene(polys: Vec<Polygon>) -> Result<(), String> {
-    let slot = VIEWPORT_PROXY.get().ok_or("viewport not started")?;
-    let guard = slot.lock().unwrap();
-    let proxy = guard.as_ref().ok_or("viewport not started")?;
-    proxy
-        .send_event(UserEvent::LoadScene(polys))
+    with_proxy(|p| p.send_event(UserEvent::LoadScene(polys)))?
         .map_err(|_| "viewport event loop closed".to_string())
 }

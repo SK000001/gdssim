@@ -19,7 +19,7 @@ fn ping() -> &'static str {
 
 #[tauri::command]
 fn open_viewport() -> Result<String, String> {
-    viewport::spawn()?;
+    viewport::show()?;
     Ok("opened".into())
 }
 
@@ -67,6 +67,12 @@ fn load_gds(path: String) -> Result<LoadGdsResult, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = env_logger::try_init();
+    // Bring the viewport thread up before Tauri starts. Subsequent
+    // `open_viewport` / `load_gds` commands send events into its event
+    // loop; closing the window doesn't tear the loop down.
+    if let Err(e) = viewport::init() {
+        log::error!("viewport init failed: {e}");
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
