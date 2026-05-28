@@ -20,8 +20,9 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 use winit::{
     application::ApplicationHandler,
-    event::WindowEvent,
+    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy},
+    keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
 
@@ -143,11 +144,17 @@ struct GpuState {
     uniform_bg: wgpu::BindGroup,
     /// Latest uploaded scene. None until first LoadScene.
     scene_buffers: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
-    /// World-space view: half-width and half-height around `view_center`.
+    /// World-space view: half-height around `view_center`; half-width
+    /// is derived from surface aspect.
     view_center: [f32; 2],
     view_half_h: f32,
-    /// Cached bbox of the loaded scene (used by fit / reset).
+    /// Cached bbox of the loaded scene (used by fit).
     scene_bbox: gds::Bbox,
+    /// Cursor position in physical pixels (top-left origin).
+    cursor_px: [f32; 2],
+    /// Middle-button drag state.
+    panning: bool,
+    pan_last_px: [f32; 2],
     window: Arc<Window>,
 }
 
@@ -291,6 +298,9 @@ impl GpuState {
             view_center,
             view_half_h,
             scene_bbox: gds::Bbox { min: [0.0; 2], max: [0.0; 2] },
+            cursor_px: [0.0, 0.0],
+            panning: false,
+            pan_last_px: [0.0, 0.0],
             window,
         }
     }
@@ -326,13 +336,59 @@ impl GpuState {
         let cy = ((b.min[1] + b.max[1]) * 0.5) as f32;
         let w = (b.max[0] - b.min[0]) as f32;
         let h = (b.max[1] - b.min[1]) as f32;
-        let aspect = if self.config.height > 0 {
-            self.config.width as f32 / self.config.height as f32
-        } else { 1.0 };
-        // We want half_h to be at least h/2 and at least (w/aspect)/2.
-        let half_h = (h * 0.5).max((w / aspect.max(1e-6)) * 0.5) * 1.1; // 10% pad
+        let aspect = self.aspect().max(1e-6);
+        let half_h = (h * 0.5).max((w / aspect) * 0.5) * 1.1; // 10% pad
         self.view_center = [cx, cy];
         self.view_half_h = half_h.max(1.0);
+        self.write_proj();
+    }
+
+    fn aspect(&self) -> f32 {
+        if self.config.height > 0 {
+            self.config.width as f32 / self.config.height as f32
+        } else {
+            1.0
+        }
+    }
+
+    fn view_half_w(&self) -> f32 {
+        self.view_half_h * self.aspect()
+    }
+
+    /// Convert a physical-pixel position to world coords under the
+    /// current view.
+    fn pixel_to_world(&self, px: [f32; 2]) -> [f32; 2] {
+        let w = self.config.width.max(1) as f32;
+        let h = self.config.height.max(1) as f32;
+        let nx = (px[0] / w) * 2.0 - 1.0;
+        let ny = 1.0 - (px[1] / h) * 2.0;
+        [
+            self.view_center[0] + nx * self.view_half_w(),
+            self.view_center[1] + ny * self.view_half_h,
+        ]
+    }
+
+    /// Zoom by `factor` (>1 zooms out, <1 zooms in) anchored on the
+    /// world point under `px`.
+    fn zoom_at(&mut self, px: [f32; 2], factor: f32) {
+        let before = self.pixel_to_world(px);
+        let new_half = (self.view_half_h * factor).clamp(1e-3, 1e12);
+        self.view_half_h = new_half;
+        let after = self.pixel_to_world(px);
+        self.view_center[0] += before[0] - after[0];
+        self.view_center[1] += before[1] - after[1];
+        self.write_proj();
+    }
+
+    /// Pan by a pixel delta (cursor moved by `(dx, dy)` while panning);
+    /// world moves opposite so content tracks the cursor.
+    fn pan_pixels(&mut self, dx: f32, dy: f32) {
+        let w = self.config.width.max(1) as f32;
+        let h = self.config.height.max(1) as f32;
+        let dwx = (dx / w) * 2.0 * self.view_half_w();
+        let dwy = (dy / h) * 2.0 * self.view_half_h;
+        self.view_center[0] -= dwx;
+        self.view_center[1] += dwy; // pixel y down ↔ world y up
         self.write_proj();
     }
 
@@ -466,6 +522,51 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => state.resize(size.width, size.height),
+            WindowEvent::CursorMoved { position, .. } => {
+                let p = [position.x as f32, position.y as f32];
+                if state.panning {
+                    let dx = p[0] - state.pan_last_px[0];
+                    let dy = p[1] - state.pan_last_px[1];
+                    state.pan_pixels(dx, dy);
+                }
+                state.cursor_px = p;
+                state.pan_last_px = p;
+            }
+            WindowEvent::MouseInput { state: btn_state, button, .. } => {
+                if button == MouseButton::Middle {
+                    state.panning = btn_state == ElementState::Pressed;
+                    state.pan_last_px = state.cursor_px;
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 60.0,
+                };
+                // Wheel up (positive) zooms in → factor < 1.
+                let factor = (-lines * 0.15).exp();
+                state.zoom_at(state.cursor_px, factor);
+            }
+            WindowEvent::KeyboardInput { event: key_event, .. } => {
+                if key_event.state == ElementState::Pressed {
+                    if let PhysicalKey::Code(code) = key_event.physical_key {
+                        match code {
+                            KeyCode::KeyF => state.fit_view(),
+                            KeyCode::Equal | KeyCode::NumpadAdd => {
+                                let c = [state.config.width as f32 * 0.5,
+                                         state.config.height as f32 * 0.5];
+                                state.zoom_at(c, 0.8);
+                            }
+                            KeyCode::Minus | KeyCode::NumpadSubtract => {
+                                let c = [state.config.width as f32 * 0.5,
+                                         state.config.height as f32 * 0.5];
+                                state.zoom_at(c, 1.25);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
             WindowEvent::RedrawRequested => {
                 match state.render() {
                     Ok(()) => {}
