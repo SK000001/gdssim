@@ -18,13 +18,8 @@ fn ping() -> &'static str {
 
 #[tauri::command]
 fn load_gds(path: String) -> Result<viewport::Scene, String> {
-    // gds21 reads BGNLIB/BGNSTR date stamps via chrono, which can panic
-    // on garbage dates real files sometimes carry. The Tauri command
-    // runs on a webview COM callback path; a bare panic crosses an FFI
-    // boundary and aborts. Trap it. (Sanitizer in gds.rs handles the
-    // common case; this is a defence-in-depth backstop.)
     let path = PathBuf::from(path);
-    let polys = std::panic::catch_unwind(|| gds::load_and_flatten(&path))
+    let info = std::panic::catch_unwind(|| gds::load_and_flatten(&path))
         .map_err(|p| {
             let msg = p
                 .downcast_ref::<&'static str>()
@@ -34,7 +29,7 @@ fn load_gds(path: String) -> Result<viewport::Scene, String> {
             format!("parser panic: {msg}")
         })?
         .map_err(|e| e.to_string())?;
-    Ok(viewport::build_scene(&polys))
+    Ok(viewport::build_scene(&info))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

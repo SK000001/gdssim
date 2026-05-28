@@ -56,6 +56,14 @@ pub enum GdsError {
     Empty,
 }
 
+/// Library-level metadata we want to surface in the UI for debugging.
+#[derive(Debug, Clone)]
+pub struct LoadInfo {
+    pub top_cell: String,
+    pub cell_names: Vec<String>,
+    pub polygons: Vec<Polygon>,
+}
+
 /// Load `path` and return all polygons of the top cell, with the
 /// hierarchy flattened.
 ///
@@ -65,7 +73,7 @@ pub enum GdsError {
 /// which panics. We patch those record bodies to a safe sentinel date
 /// (1980-01-01 00:00:00) before parsing — gds21 only uses the dates
 /// for library metadata, which we discard anyway.
-pub fn load_and_flatten(path: &Path) -> Result<Vec<Polygon>, GdsError> {
+pub fn load_and_flatten(path: &Path) -> Result<LoadInfo, GdsError> {
     let bytes = std::fs::read(path).map_err(|e| GdsError::Parse(format!("read: {e}")))?;
     let patched = sanitize_dates(&bytes);
     let tmp = tempfile::Builder::new()
@@ -76,7 +84,7 @@ pub fn load_and_flatten(path: &Path) -> Result<Vec<Polygon>, GdsError> {
     std::fs::write(tmp.path(), &patched)
         .map_err(|e| GdsError::Parse(format!("tempfile write: {e}")))?;
     let lib = GdsLibrary::load(tmp.path()).map_err(|e| GdsError::Parse(format!("{e:?}")))?;
-    flatten_library(&lib)
+    flatten_library_info(&lib)
 }
 
 /// Walk the GDS record stream and overwrite the 12 i16 date words of
@@ -118,15 +126,24 @@ fn sanitize_dates(input: &[u8]) -> Vec<u8> {
 
 /// Like [`load_and_flatten`] but starts from a pre-parsed library.
 pub fn flatten_library(lib: &GdsLibrary) -> Result<Vec<Polygon>, GdsError> {
+    flatten_library_info(lib).map(|i| i.polygons)
+}
+
+pub fn flatten_library_info(lib: &GdsLibrary) -> Result<LoadInfo, GdsError> {
     if lib.structs.is_empty() {
         return Err(GdsError::Empty);
     }
     let by_name: HashMap<&str, &GdsStruct> =
         lib.structs.iter().map(|s| (s.name.as_str(), s)).collect();
     let top = top_struct(lib);
-    let mut out = Vec::new();
-    flatten_struct(top, IDENTITY, &by_name, &mut out, 0);
-    Ok(out)
+    let mut polygons = Vec::new();
+    flatten_struct(top, IDENTITY, &by_name, &mut polygons, 0);
+    let cell_names: Vec<String> = lib.structs.iter().map(|s| s.name.clone()).collect();
+    Ok(LoadInfo {
+        top_cell: top.name.clone(),
+        cell_names,
+        polygons,
+    })
 }
 
 /// Bbox of a polygon set in database units.
@@ -141,8 +158,10 @@ pub fn bbox(polys: &[Polygon]) -> Bbox {
 }
 
 /// Pick the "top" structure: one that no other struct references.
-/// Falls back to the last-defined struct if all are referenced (or
-/// only one exists).
+/// Prefers the LAST unreferenced cell — gdsfactory and most other
+/// tools write the top cell at the end of the library after all its
+/// sub-cells. Falls back to the last-defined struct if all are
+/// referenced (or only one exists).
 fn top_struct(lib: &GdsLibrary) -> &GdsStruct {
     let mut referenced: HashSet<&str> = HashSet::new();
     for s in &lib.structs {
@@ -156,6 +175,7 @@ fn top_struct(lib: &GdsLibrary) -> &GdsStruct {
     }
     lib.structs
         .iter()
+        .rev()
         .find(|s| !referenced.contains(s.name.as_str()))
         .unwrap_or_else(|| lib.structs.last().expect("non-empty checked by caller"))
 }
@@ -489,7 +509,9 @@ mod tests {
         let path = dir.path().join("sample.gds");
         lib.save(&path).expect("save");
 
-        let polys = load_and_flatten(&path).expect("load+flatten");
+        let info = load_and_flatten(&path).expect("load+flatten");
+        assert_eq!(info.top_cell, "TOP");
+        let polys = &info.polygons;
         // Expect 2 polygons: TOP's layer-2 rect + the SREF'd CHILD rect on layer 1.
         assert_eq!(polys.len(), 2, "polys: {:?}", polys);
 
@@ -506,7 +528,7 @@ mod tests {
         assert!(ys.iter().all(|&y| y >= 0.0 - 1e-6 && y <= 500.0 + 1e-6),
                 "child ys: {:?}", ys);
 
-        let b = bbox(&polys);
+        let b = bbox(polys);
         assert!((b.min[0] - 0.0).abs() < 1e-6);
         assert!((b.max[0] - 3000.0).abs() < 1e-6);
         assert!((b.min[1] - 0.0).abs() < 1e-6);

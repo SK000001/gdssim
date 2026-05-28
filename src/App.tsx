@@ -8,6 +8,8 @@ type Summary = {
   polygon_count: number;
   bbox_min: [number, number];
   bbox_max: [number, number];
+  top_cell: string;
+  cell_names: string[];
 };
 
 function App() {
@@ -78,6 +80,8 @@ function App() {
         polygon_count: scene.polygon_count,
         bbox_min: scene.bbox_min,
         bbox_max: scene.bbox_max,
+        top_cell: scene.top_cell,
+        cell_names: scene.cell_names,
       });
     } catch (e) {
       setError(String(e));
@@ -112,6 +116,27 @@ function App() {
           </span>
         )}
       </div>
+
+      {loaded && (
+        <div className="cellpanel">
+          <div className="lp-hd">Cells</div>
+          <div className="muted" style={{ marginBottom: "0.4rem" }}>
+            top: <code>{loaded.top_cell}</code> · {loaded.cell_names.length} cells in lib
+          </div>
+          <details>
+            <summary className="muted" style={{ cursor: "pointer", fontSize: "0.8rem" }}>
+              all cells
+            </summary>
+            <ul style={{ margin: "0.3rem 0 0", padding: "0 0 0 1rem", fontSize: "0.8rem", color: "#bbb" }}>
+              {loaded.cell_names.map((n) => (
+                <li key={n} style={{ fontFamily: "ui-monospace, monospace" }}>
+                  {n === loaded.top_cell ? <strong>{n}</strong> : n}
+                </li>
+              ))}
+            </ul>
+          </details>
+        </div>
+      )}
 
       {layers.length > 0 && (
         <div className="layerpanel">

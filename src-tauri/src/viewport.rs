@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::gds::{self, Polygon};
+use crate::gds::{self, LoadInfo};
 
 /// Deterministic colour per GDS layer. H2c-followup will swap this
 /// for a JSON technology file (mapping (layer, datatype) → name + colour).
@@ -65,9 +65,12 @@ pub struct Scene {
     pub bbox_min: [f64; 2],
     pub bbox_max: [f64; 2],
     pub layers: Vec<LayerData>,
+    pub top_cell: String,
+    pub cell_names: Vec<String>,
 }
 
-pub fn build_scene(polys: &[Polygon]) -> Scene {
+pub fn build_scene(info: &LoadInfo) -> Scene {
+    let polys = &info.polygons;
     let bbox = gds::bbox(polys);
     let mut by_layer: BTreeMap<i16, LayerBuf> = BTreeMap::new();
 
@@ -125,5 +128,7 @@ pub fn build_scene(polys: &[Polygon]) -> Scene {
         bbox_min: bbox.min,
         bbox_max: bbox.max,
         layers,
+        top_cell: info.top_cell.clone(),
+        cell_names: info.cell_names.clone(),
     }
 }

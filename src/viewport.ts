@@ -24,6 +24,8 @@ export type SceneData = {
   bbox_min: [number, number];
   bbox_max: [number, number];
   layers: LayerData[];
+  top_cell: string;
+  cell_names: string[];
 };
 
 export type LayerInfo = {
