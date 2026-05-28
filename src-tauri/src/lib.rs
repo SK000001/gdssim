@@ -60,6 +60,8 @@ fn load_gds(path: String) -> Result<LoadGdsResult, String> {
         bbox_min: bbox.min,
         bbox_max: bbox.max,
     };
+    // Make sure the viewport is visible before we hand it the scene.
+    viewport::show()?;
     viewport::send_scene(polys)?;
     Ok(summary)
 }
@@ -67,11 +69,14 @@ fn load_gds(path: String) -> Result<LoadGdsResult, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = env_logger::try_init();
-    // Bring the viewport thread up before Tauri starts. Subsequent
-    // `open_viewport` / `load_gds` commands send events into its event
-    // loop; closing the window doesn't tear the loop down.
+    // Bring the viewport thread up before Tauri starts and show its
+    // window immediately — the app is the viewport; the webview is
+    // just a control strip. Closing the viewport doesn't tear the
+    // loop down, so `load_gds` can still reopen it on demand.
     if let Err(e) = viewport::init() {
         log::error!("viewport init failed: {e}");
+    } else if let Err(e) = viewport::show() {
+        log::error!("viewport show failed: {e}");
     }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())

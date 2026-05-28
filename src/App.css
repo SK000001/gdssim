@@ -40,6 +40,42 @@ body {
   font-size: 0.85rem;
 }
 
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.75rem 0 1.25rem;
+  margin-bottom: 1rem;
+  border-bottom: 1px solid #2a2a2a;
+}
+
+.title {
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: #ddd;
+}
+
+.muted {
+  color: #888;
+  font-size: 0.85rem;
+}
+
+button.primary {
+  background: #2d4a8a;
+  border-color: #3a5fb0;
+  color: #fff;
+}
+
+button.primary:hover {
+  background: #355aa3;
+  border-color: #4a72c8;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .panel {
   background: #222;
   border: 1px solid #2e2e2e;

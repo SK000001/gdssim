@@ -12,27 +12,16 @@ type LoadGdsResult = {
 
 function App() {
   const [pong, setPong] = useState<string>("(not pinged)");
-  const [viewportStatus, setViewportStatus] = useState<string>("closed");
   const [loaded, setLoaded] = useState<LoadGdsResult | null>(null);
   const [loadedPath, setLoadedPath] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     invoke<string>("ping")
       .then(setPong)
       .catch((e) => setPong(`error: ${e}`));
   }, []);
-
-  async function openViewport() {
-    setError(null);
-    try {
-      setViewportStatus("opening...");
-      const result = await invoke<string>("open_viewport");
-      setViewportStatus(result);
-    } catch (e) {
-      setViewportStatus(`error: ${e}`);
-    }
-  }
 
   async function pickAndLoad() {
     setError(null);
@@ -44,40 +33,25 @@ function App() {
       });
       if (!picked || typeof picked !== "string") return;
       setLoadedPath(picked);
+      setLoading(true);
       const result = await invoke<LoadGdsResult>("load_gds", { path: picked });
       setLoaded(result);
     } catch (e) {
       setError(String(e));
+    } finally {
+      setLoading(false);
     }
   }
 
   return (
     <main className="app">
-      <header className="hdr">
-        <h1>GDSSIM</h1>
-        <span className="tag">interactive GDS-layout simulator · H2a viewer</span>
+      <header className="topbar">
+        <button className="primary" onClick={pickAndLoad} disabled={loading}>
+          {loading ? "Loading…" : "Open .gds file…"}
+        </button>
+        <span className="title">GDSSIM</span>
+        <span className="tag">H2b · viewer + camera</span>
       </header>
-
-      <section className="panel">
-        <h2>Status</h2>
-        <ul>
-          <li>IPC ping: <code>{pong}</code></li>
-          <li>GPU viewport: <code>{viewportStatus}</code></li>
-        </ul>
-      </section>
-
-      <section className="panel">
-        <h2>GPU Viewport</h2>
-        <p>
-          Opens a separate Rust-owned native window. Open it first, then
-          load a <code>.gds</code> file — the parsed polygons render in
-          place of the H1 demo rectangle, fitted to the loaded bbox.
-        </p>
-        <div className="row">
-          <button onClick={openViewport}>Open viewport window</button>
-          <button onClick={pickAndLoad}>Open .gds file…</button>
-        </div>
-      </section>
 
       {loaded && (
         <section className="panel">
@@ -103,9 +77,21 @@ function App() {
         </section>
       )}
 
-      <footer className="ftr">
-        Phase 2a — GDS loading + first viewer. See <code>roadmap.md</code> Track H.
-      </footer>
+      {!loaded && !error && (
+        <section className="panel">
+          <h2>Viewport controls</h2>
+          <ul>
+            <li>Mouse wheel — zoom (cursor-anchored)</li>
+            <li>Middle drag — pan</li>
+            <li><code>F</code> — fit to scene</li>
+            <li><code>+ / -</code> — step zoom</li>
+          </ul>
+          <p className="muted">
+            The viewport opens automatically with the app. Pick a <code>.gds</code>
+            file above to load polygons. IPC: <code>{pong}</code>.
+          </p>
+        </section>
+      )}
     </main>
   );
 }
