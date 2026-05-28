@@ -208,6 +208,86 @@ fn ref_transform(
     }
 }
 
+/// Extend the start / end of a path centerline according to its
+/// `path_type`. Type 0 = flush (no extension); type 1 = round (treat
+/// as flush — we'd need an arc otherwise); type 2 = square extended
+/// by half-width; type 4 = custom extensions from `BGNEXTN` / `ENDEXTN`.
+fn extend_path_endpoints(
+    mut pts: Vec<[f64; 2]>,
+    path_type: i16,
+    width: f64,
+    bgn_extn: f64,
+    end_extn: f64,
+) -> Vec<[f64; 2]> {
+    if pts.len() < 2 {
+        return pts;
+    }
+    let (bgn_amt, end_amt) = match path_type {
+        2 => (width * 0.5, width * 0.5),
+        4 => (bgn_extn, end_extn),
+        _ => (0.0, 0.0),
+    };
+    if bgn_amt > 0.0 {
+        let d = sub2(pts[1], pts[0]);
+        let n = norm2(d);
+        pts[0] = [pts[0][0] - n[0] * bgn_amt, pts[0][1] - n[1] * bgn_amt];
+    }
+    if end_amt > 0.0 {
+        let last = pts.len() - 1;
+        let d = sub2(pts[last], pts[last - 1]);
+        let n = norm2(d);
+        pts[last] = [pts[last][0] + n[0] * end_amt, pts[last][1] + n[1] * end_amt];
+    }
+    pts
+}
+
+/// Offset a polyline by ±width/2 along the bisector at each vertex,
+/// producing a closed ring (left forward + right reversed). Miter
+/// length is capped at 4× half-width to avoid sharp-angle spikes.
+fn path_to_polygon(centerline: &[[f64; 2]], width: f64) -> Vec<[f64; 2]> {
+    let hw = width * 0.5;
+    let n = centerline.len();
+    if n < 2 || hw <= 0.0 {
+        return vec![];
+    }
+    let mut left = Vec::with_capacity(n);
+    let mut right = Vec::with_capacity(n);
+    let max_miter = hw * 4.0;
+    for i in 0..n {
+        let dir_in = if i == 0 {
+            sub2(centerline[1], centerline[0])
+        } else {
+            sub2(centerline[i], centerline[i - 1])
+        };
+        let dir_out = if i == n - 1 {
+            sub2(centerline[n - 1], centerline[n - 2])
+        } else {
+            sub2(centerline[i + 1], centerline[i])
+        };
+        let n_in = norm2(dir_in);
+        let n_out = norm2(dir_out);
+        let perp_in = [-n_in[1], n_in[0]];
+        let perp_out = [-n_out[1], n_out[0]];
+        let bisect_raw = [perp_in[0] + perp_out[0], perp_in[1] + perp_out[1]];
+        let bisect = norm2(bisect_raw);
+        let dot = bisect[0] * perp_in[0] + bisect[1] * perp_in[1];
+        let miter = if dot.abs() > 1e-3 { hw / dot } else { max_miter };
+        let m = miter.abs().min(max_miter);
+        left.push([centerline[i][0] + bisect[0] * m, centerline[i][1] + bisect[1] * m]);
+        right.push([centerline[i][0] - bisect[0] * m, centerline[i][1] - bisect[1] * m]);
+    }
+    let mut polygon = left;
+    polygon.extend(right.iter().rev().copied());
+    polygon
+}
+
+fn sub2(a: [f64; 2], b: [f64; 2]) -> [f64; 2] { [a[0] - b[0], a[1] - b[1]] }
+
+fn norm2(v: [f64; 2]) -> [f64; 2] {
+    let len = (v[0] * v[0] + v[1] * v[1]).sqrt();
+    if len < 1e-12 { [0.0, 0.0] } else { [v[0] / len, v[1] / len] }
+}
+
 fn flatten_struct(
     s: &GdsStruct,
     parent: Affine,
@@ -272,10 +352,24 @@ fn flatten_struct(
                     }
                 }
             }
-            // Paths/text/nodes ignored for H2a — H2b+ may add path-to-polygon.
-            GdsElement::GdsPath(_)
-            | GdsElement::GdsTextElem(_)
-            | GdsElement::GdsNode(_) => {}
+            GdsElement::GdsPath(p) => {
+                let local: Vec<[f64; 2]> = p.xy.iter().map(|q| [q.x as f64, q.y as f64]).collect();
+                let width = p.width.unwrap_or(0) as f64;
+                if width <= 0.0 || local.len() < 2 { continue; }
+                let path_type = p.path_type.unwrap_or(0);
+                let bgn_extn = p.begin_extn.unwrap_or(0) as f64;
+                let end_extn = p.end_extn.unwrap_or(0) as f64;
+                let extended = extend_path_endpoints(local, path_type, width, bgn_extn, end_extn);
+                let poly_local = path_to_polygon(&extended, width);
+                if poly_local.len() < 3 { continue; }
+                let poly: Vec<[f64; 2]> = poly_local.into_iter().map(|pt| parent.apply(pt)).collect();
+                out.push(Polygon {
+                    layer: p.layer,
+                    datatype: p.datatype,
+                    points: poly,
+                });
+            }
+            GdsElement::GdsTextElem(_) | GdsElement::GdsNode(_) => {}
         }
     }
 }
@@ -328,6 +422,33 @@ mod tests {
             structs: vec![child, top],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn path_to_polygon_horizontal_segment() {
+        // 1000-unit horizontal segment, width 100 → expect 200×1000 polygon.
+        let centerline = vec![[0.0, 0.0], [1000.0, 0.0]];
+        let poly = path_to_polygon(&centerline, 100.0);
+        assert_eq!(poly.len(), 4);
+        let xs: Vec<f64> = poly.iter().map(|p| p[0]).collect();
+        let ys: Vec<f64> = poly.iter().map(|p| p[1]).collect();
+        let xmin = xs.iter().cloned().fold(f64::INFINITY, f64::min);
+        let xmax = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let ymin = ys.iter().cloned().fold(f64::INFINITY, f64::min);
+        let ymax = ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!((xmin - 0.0).abs() < 1e-6);
+        assert!((xmax - 1000.0).abs() < 1e-6);
+        assert!((ymin - -50.0).abs() < 1e-6);
+        assert!((ymax - 50.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn extend_path_endpoints_square_cap() {
+        // path_type 2 should extend each end by width/2 along its tangent.
+        let pts = vec![[0.0, 0.0], [1000.0, 0.0]];
+        let extended = extend_path_endpoints(pts, 2, 100.0, 0.0, 0.0);
+        assert!((extended[0][0] - -50.0).abs() < 1e-6);
+        assert!((extended[1][0] - 1050.0).abs() < 1e-6);
     }
 
     #[test]
