@@ -600,7 +600,22 @@ pub fn spawn() -> Result<(), String> {
     std::thread::Builder::new()
         .name("gdssim-viewport".into())
         .spawn(|| {
-            let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
+            // Tauri owns the main thread, so the viewport's winit event
+            // loop has to opt in to running on a worker. Windows + X11
+            // expose this; macOS hard-requires the main thread (a later
+            // port would have to restructure for that).
+            let mut builder = EventLoop::<UserEvent>::with_user_event();
+            #[cfg(target_os = "windows")]
+            {
+                use winit::platform::windows::EventLoopBuilderExtWindows;
+                builder.with_any_thread(true);
+            }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                use winit::platform::x11::EventLoopBuilderExtX11;
+                builder.with_any_thread(true);
+            }
+            let event_loop = match builder.build() {
                 Ok(el) => el,
                 Err(e) => {
                     log::error!("event loop init failed: {e:?}");
