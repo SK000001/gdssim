@@ -33,8 +33,23 @@ struct LoadGdsResult {
 
 #[tauri::command]
 fn load_gds(path: String) -> Result<LoadGdsResult, String> {
+    // gds21 reads BGNLIB / BGNSTR date stamps via chrono, which can
+    // panic on out-of-range / garbage dates that real-world GDS files
+    // sometimes carry. The Tauri command runs on a webview COM
+    // callback path, so a bare panic crosses an FFI boundary and
+    // aborts the process. Trap it.
     let path = PathBuf::from(path);
-    let polys = gds::load_and_flatten(&path).map_err(|e| e.to_string())?;
+    let polys = std::panic::catch_unwind(|| gds::load_and_flatten(&path))
+        .map_err(|p| {
+            let msg = p
+                .downcast_ref::<&'static str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic in GDS parser (likely a malformed date in the file header)".into());
+            format!("parser panic: {msg}")
+        })?
+        .map_err(|e| e.to_string())?;
+
     let bbox = gds::bbox(&polys);
     let mut layers: Vec<i16> = polys.iter().map(|p| p.layer).collect();
     layers.sort_unstable();
