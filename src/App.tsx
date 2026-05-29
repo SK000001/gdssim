@@ -8,6 +8,7 @@ import {
   type Diag,
   type PolygonHit,
   type Transistor,
+  type Logic,
 } from "./viewport";
 import "./App.css";
 
@@ -19,8 +20,54 @@ type Summary = {
   cell_names: string[];
 };
 
+/** Rings per device-net id, from the `device_nets_geometry` IPC. */
+type DeviceGeom = [number, number][][][];
+
 /** Stable key for a (layer, datatype) technology style. */
 const styleKey = (layer: number, datatype: number) => `${layer}/${datatype}`;
+
+/** Even-odd point-in-ring test (database units). */
+function pointInRing(ring: [number, number][], px: number, py: number): boolean {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], yi = ring[i][1];
+    const xj = ring[j][0], yj = ring[j][1];
+    if (yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+function ringArea(ring: [number, number][]): number {
+  let a = 0;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    a += ring[j][0] * ring[i][1] - ring[i][0] * ring[j][1];
+  }
+  return Math.abs(a) * 0.5;
+}
+
+/** Device net under a world point: the one with the smallest containing
+ *  ring (mirrors the Rust hit-test's "most specific feature wins"). */
+function deviceNetAt(geom: DeviceGeom, x: number, y: number): number | null {
+  let best: number | null = null;
+  let bestArea = Infinity;
+  geom.forEach((rings, net) => {
+    for (const r of rings) {
+      if (pointInRing(r, x, y)) {
+        const a = ringArea(r);
+        if (a < bestArea) {
+          bestArea = a;
+          best = net;
+        }
+      }
+    }
+  });
+  return best;
+}
+
+const SIM_RED: [number, number, number, number] = [0.95, 0.25, 0.25, 0.5];
+const SIM_BLUE: [number, number, number, number] = [0.3, 0.55, 1.0, 0.5];
 
 function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -37,6 +84,19 @@ function App() {
   const [selected, setSelected] = useState<PolygonHit | null>(null);
   const [transistors, setTransistors] = useState<Transistor[]>([]);
   const [activeFet, setActiveFet] = useState<number | null>(null);
+  // --- H5b digital sim ---
+  const [simMode, setSimMode] = useState(false);
+  const [deviceGeom, setDeviceGeom] = useState<DeviceGeom>([]);
+  const [vddNet, setVddNet] = useState<number | null>(null);
+  const [gndNet, setGndNet] = useState<number | null>(null);
+  const [inputs, setInputs] = useState<Record<number, 0 | 1>>({});
+  const [simValues, setSimValues] = useState<Logic[]>([]);
+  const [selectedNet, setSelectedNet] = useState<number | null>(null);
+  // Refs so the (once-bound) onPick handler reads live sim state.
+  const simModeRef = useRef(false);
+  const deviceGeomRef = useRef<DeviceGeom>([]);
+  simModeRef.current = simMode;
+  deviceGeomRef.current = deviceGeom;
 
   useEffect(() => {
     if (!canvasRef.current) return;
@@ -50,6 +110,13 @@ function App() {
     };
     vp.onDiag = (d) => setDiag(d);
     vp.onPick = async (world) => {
+      // Sim mode: clicks select a device net to assign a role to.
+      if (simModeRef.current) {
+        const net = deviceNetAt(deviceGeomRef.current, world[0], world[1]);
+        setSelectedNet(net);
+        vp.setHighlight(net != null ? deviceGeomRef.current[net] : null);
+        return;
+      }
       try {
         const hit = await invoke<PolygonHit | null>("hit_test", {
           x: world[0],
@@ -131,6 +198,54 @@ function App() {
     [transistors]
   );
 
+  // Assign a role to a device net, keeping VDD/GND unique and a net in at
+  // most one role.
+  const assignRole = useCallback((net: number, role: "vdd" | "gnd" | "in" | "clear") => {
+    setVddNet((v) => (role === "vdd" ? net : v === net ? null : v));
+    setGndNet((g) => (role === "gnd" ? net : g === net ? null : g));
+    setInputs((ins) => {
+      const next = { ...ins };
+      delete next[net];
+      if (role === "in") next[net] = 0;
+      return next;
+    });
+  }, []);
+
+  const runSim = useCallback(async () => {
+    const vp = viewportRef.current;
+    if (!vp || deviceGeom.length === 0) return;
+    const fixed: [number, Logic][] = [];
+    if (vddNet != null) fixed.push([vddNet, "one"]);
+    if (gndNet != null) fixed.push([gndNet, "zero"]);
+    for (const [k, v] of Object.entries(inputs)) fixed.push([Number(k), v ? "one" : "zero"]);
+    if (fixed.length === 0) {
+      setSimValues([]);
+      vp.setSimOverlay(null);
+      return;
+    }
+    const values = await invoke<Logic[]>("simulate_nets", { fixed });
+    setSimValues(values);
+    const ones: [number, number][][] = [];
+    const zeros: [number, number][][] = [];
+    values.forEach((val, net) => {
+      const rings = deviceGeom[net];
+      if (!rings) return;
+      if (val === "one") ones.push(...rings);
+      else if (val === "zero") zeros.push(...rings);
+    });
+    vp.setSimOverlay([
+      { color: SIM_RED, rings: ones },
+      { color: SIM_BLUE, rings: zeros },
+    ]);
+  }, [vddNet, gndNet, inputs, deviceGeom]);
+
+  // Re-solve whenever assignments change; clear the overlay when sim mode
+  // is off.
+  useEffect(() => {
+    if (simMode) runSim();
+    else viewportRef.current?.setSimOverlay(null);
+  }, [simMode, runSim]);
+
   async function pickAndLoad() {
     setError(null);
     try {
@@ -152,6 +267,13 @@ function App() {
         cell_names: scene.cell_names,
       });
       setTransistors(await invoke<Transistor[]>("transistors"));
+      setDeviceGeom(await invoke<DeviceGeom>("device_nets_geometry"));
+      // Reset sim assignments for the new layout.
+      setVddNet(null);
+      setGndNet(null);
+      setInputs({});
+      setSimValues([]);
+      setSelectedNet(null);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -170,8 +292,22 @@ function App() {
         <button onClick={() => viewportRef.current?.fitView()} disabled={!loaded}>
           Fit (F)
         </button>
+        <button
+          onClick={() => {
+            setSimMode((m) => !m);
+            setSelected(null);
+            setActiveFet(null);
+            viewportRef.current?.setHighlight(null);
+          }}
+          disabled={!loaded}
+          className={simMode ? "primary" : ""}
+        >
+          {simMode ? "Exit sim" : "Simulate"}
+        </button>
         <span className="title">GDSSIM</span>
-        <span className="tag">H4 · transistors · click a device</span>
+        <span className="tag">
+          {simMode ? "H5 · click a net → assign VDD/GND/input" : "H4 · transistors · click a device"}
+        </span>
         <span className="spacer" />
         {loaded && (
           <span className="summary">
@@ -252,6 +388,70 @@ function App() {
               </span>
             </div>
           ))}
+        </div>
+      )}
+
+      {simMode && (
+        <div className="simpanel">
+          <div className="lp-hd">
+            Simulation
+            <span className="sim-legend">
+              <span className="sim-dot one" /> 1
+              <span className="sim-dot zero" /> 0
+              <span className="sim-dot x" /> X
+            </span>
+          </div>
+
+          <div className="sim-roles">
+            <div className="sim-role">
+              <span className="sim-tag vdd">VDD</span>
+              <span>{vddNet != null ? `net #${vddNet}` : <em className="muted">unset</em>}</span>
+            </div>
+            <div className="sim-role">
+              <span className="sim-tag gnd">GND</span>
+              <span>{gndNet != null ? `net #${gndNet}` : <em className="muted">unset</em>}</span>
+            </div>
+            <div className="sim-role">
+              <span className="sim-tag in">IN</span>
+              {Object.keys(inputs).length === 0 ? (
+                <em className="muted">none</em>
+              ) : (
+                <span className="sim-inputs">
+                  {Object.entries(inputs).map(([k, v]) => (
+                    <button
+                      key={k}
+                      className={"sim-input " + (v ? "hi" : "lo")}
+                      title={`net #${k} — click to toggle`}
+                      onClick={() => setInputs((s) => ({ ...s, [Number(k)]: s[Number(k)] ? 0 : 1 }))}
+                    >
+                      #{k}={v}
+                    </button>
+                  ))}
+                </span>
+              )}
+            </div>
+          </div>
+
+          {selectedNet != null ? (
+            <div className="sim-sel">
+              <div>
+                net <strong>#{selectedNet}</strong>
+                {simValues[selectedNet] && (
+                  <span className={"sim-val " + simValues[selectedNet]}>
+                    {" "}= {simValues[selectedNet].toUpperCase()}
+                  </span>
+                )}
+              </div>
+              <div className="sim-btns">
+                <button onClick={() => assignRole(selectedNet, "vdd")}>VDD</button>
+                <button onClick={() => assignRole(selectedNet, "gnd")}>GND</button>
+                <button onClick={() => assignRole(selectedNet, "in")}>Input</button>
+                <button onClick={() => assignRole(selectedNet, "clear")}>Clear</button>
+              </div>
+            </div>
+          ) : (
+            <div className="muted sim-hint">Click a net in the layout to assign a role.</div>
+          )}
         </div>
       )}
 

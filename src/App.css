@@ -250,6 +250,88 @@ code {
   text-overflow: ellipsis;
 }
 
+.simpanel {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(20, 20, 26, 0.9);
+  border: 1px solid #2a2a30;
+  border-radius: 6px;
+  padding: 0.5rem 0.8rem;
+  z-index: 9;
+  min-width: 320px;
+  max-width: 80vw;
+  user-select: none;
+}
+
+.sim-legend {
+  float: right;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.72rem;
+  color: #aaa;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.sim-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+  margin-left: 0.5rem;
+}
+.sim-dot.one { background: rgb(228, 70, 70); }
+.sim-dot.zero { background: rgb(78, 140, 255); }
+.sim-dot.x { background: #777; }
+
+.sim-roles {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin: 0.2rem 0 0.4rem;
+  font-size: 0.83rem;
+}
+.sim-role { display: flex; align-items: center; gap: 0.5rem; }
+
+.sim-tag {
+  font-family: ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+  font-weight: 600;
+  font-size: 0.7rem;
+  padding: 0.05em 0.45em;
+  border-radius: 3px;
+  min-width: 30px;
+  text-align: center;
+}
+.sim-tag.vdd { background: #7a2a2a; color: #ffd9d9; }
+.sim-tag.gnd { background: #2a3a7a; color: #d9e2ff; }
+.sim-tag.in { background: #3a5a3a; color: #d9ffd9; }
+
+.sim-inputs { display: inline-flex; flex-wrap: wrap; gap: 0.3rem; }
+.sim-input {
+  font-family: ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+  font-size: 0.74rem;
+  padding: 0.1em 0.5em;
+}
+.sim-input.hi { border-color: #b04a4a; color: #ffbcbc; }
+.sim-input.lo { border-color: #4a6ab0; color: #bcd0ff; }
+
+.sim-sel {
+  border-top: 1px solid #2a2a30;
+  padding-top: 0.4rem;
+  font-size: 0.83rem;
+}
+.sim-btns { display: flex; gap: 0.3rem; margin-top: 0.35rem; }
+.sim-btns button { font-size: 0.76rem; padding: 0.2em 0.6em; }
+
+.sim-val { font-family: ui-monospace, monospace; font-weight: 600; }
+.sim-val.one { color: rgb(255, 120, 120); }
+.sim-val.zero { color: rgb(120, 170, 255); }
+.sim-val.x { color: #999; }
+
+.sim-hint { font-size: 0.8rem; padding-top: 0.3rem; }
+
 .inspector {
   position: absolute;
   bottom: 12px;

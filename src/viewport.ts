@@ -53,6 +53,9 @@ export type PolygonHit = {
   points: [number, number][];
 };
 
+/** Three-valued logic level from the `simulate_nets` IPC command (H5). */
+export type Logic = "zero" | "one" | "x";
+
 /** One extracted MOSFET from the `transistors` IPC command (H4). */
 export type Transistor = {
   kind: "nmos" | "pmos";
@@ -203,6 +206,16 @@ export class Viewport {
   // Triangulated highlight rings for the translucent fill.
   private hiTris: GPUBuffer | null = null;
   private hiTriCount = 0;
+  // Sim value overlay (H5b): per-colour translucent fills (e.g. red=1,
+  // blue=0) drawn under the selection highlight.
+  private simGroups: {
+    vbuf: GPUBuffer;
+    tris: GPUBuffer;
+    triCount: number;
+    buf: GPUBuffer;
+    bg: GPUBindGroup;
+  }[] = [];
+  private hiBgLayout!: GPUBindGroupLayout;
   private cam = {
     center: [0, 0] as [number, number],
     halfH: 150,
@@ -305,7 +318,7 @@ export class Viewport {
     // colour) and an alpha-blended line pipeline. Drawn in several
     // pixel-offset passes (dark halo + bright core) for a thick,
     // high-contrast outline — see the pass list below and frame().
-    const hiBgLayout = this.device.createBindGroupLayout({
+    this.hiBgLayout = this.device.createBindGroupLayout({
       entries: [
         {
           binding: 1,
@@ -314,6 +327,7 @@ export class Viewport {
         },
       ],
     });
+    const hiBgLayout = this.hiBgLayout;
     this.highlightPipeline = this.device.createRenderPipeline({
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [hiBgLayout] }),
       vertex: { module: shader, entryPoint: "vs_highlight", buffers: vertexState.buffers },
@@ -410,6 +424,7 @@ export class Viewport {
     this.destroyed = true;
     this.releaseLayerBuffers();
     this.clearHighlight();
+    this.clearSimOverlay();
     for (const p of this.hiPasses) p.buf.destroy();
     this.hiPasses = [];
     this.hiFillBuf?.destroy();
@@ -487,6 +502,66 @@ export class Viewport {
     }
   }
 
+  private clearSimOverlay() {
+    for (const g of this.simGroups) {
+      g.vbuf.destroy();
+      g.tris.destroy();
+      g.buf.destroy();
+    }
+    this.simGroups = [];
+  }
+
+  /**
+   * Sim value overlay (H5b): paint each group's polygon rings with a
+   * translucent colour (e.g. red for logic 1, blue for 0). Pass an empty
+   * array or `null` to clear. Drawn under the selection highlight.
+   */
+  setSimOverlay(
+    groups: { color: [number, number, number, number]; rings: [number, number][][] }[] | null
+  ) {
+    this.clearSimOverlay();
+    if (!groups) return;
+    for (const g of groups) {
+      const totalPts = g.rings.reduce((s, r) => s + r.length, 0);
+      if (totalPts < 3) continue;
+      const verts = new Float32Array(totalPts * VERTEX_FLOATS);
+      const tris: number[] = [];
+      let base = 0;
+      let vi = 0;
+      for (const ring of g.rings) {
+        for (let i = 0; i < ring.length; i++) {
+          verts[vi++] = ring[i][0];
+          verts[vi++] = ring[i][1];
+          vi += 3; // skip r,g,b
+        }
+        for (const t of triangulateRing(ring)) tris.push(base + t);
+        base += ring.length;
+      }
+      if (tris.length === 0) continue;
+      const vbuf = this.device.createBuffer({
+        size: verts.byteLength,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      });
+      this.device.queue.writeBuffer(vbuf, 0, verts);
+      const tarr = new Uint32Array(tris);
+      const tbuf = this.device.createBuffer({
+        size: tarr.byteLength,
+        usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+      });
+      this.device.queue.writeBuffer(tbuf, 0, tarr);
+      const buf = this.device.createBuffer({
+        size: 80,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      this.device.queue.writeBuffer(buf, 64, new Float32Array(g.color));
+      const bg = this.device.createBindGroup({
+        layout: this.hiBgLayout,
+        entries: [{ binding: 1, resource: { buffer: buf } }],
+      });
+      this.simGroups.push({ vbuf, tris: tbuf, triCount: tarr.length, buf, bg });
+    }
+  }
+
   private releaseLayerBuffers() {
     for (const l of this.gpuLayers) {
       l.vbuf.destroy();
@@ -499,6 +574,7 @@ export class Viewport {
   loadScene(s: SceneData) {
     this.releaseLayerBuffers();
     this.clearHighlight();
+    this.clearSimOverlay();
     for (const ld of s.layers) {
       if (ld.vertices.length === 0) continue;
       const verts = new Float32Array(ld.vertices);
@@ -755,6 +831,17 @@ export class Viewport {
         pass.setVertexBuffer(0, l.vbuf);
         pass.setIndexBuffer(l.edges, "uint32");
         pass.drawIndexed(l.edgeCount);
+      }
+      // Sim value overlay first (under selection): per-colour fills.
+      if (this.simGroups.length > 0) {
+        pass.setPipeline(this.highlightFillPipeline);
+        for (const g of this.simGroups) {
+          this.device.queue.writeBuffer(g.buf, 0, this.proj);
+          pass.setBindGroup(0, g.bg);
+          pass.setVertexBuffer(0, g.vbuf);
+          pass.setIndexBuffer(g.tris, "uint32");
+          pass.drawIndexed(g.triCount);
+        }
       }
       // Translucent area fill first (under the outline), at the base
       // projection so it lines up with the geometry.

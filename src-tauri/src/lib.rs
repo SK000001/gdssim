@@ -113,6 +113,27 @@ fn net_rings(net_id: u32, store: tauri::State<LoadStore>) -> Vec<Vec<[f64; 2]>> 
         .collect()
 }
 
+/// Geometry of every device net (H4 refined connectivity), indexed by
+/// net id: `result[net_id]` is that net's polygon rings. The frontend
+/// fetches this once on load to hit-test clicks onto device nets and to
+/// build the sim value overlay locally, without a round-trip per net.
+#[tauri::command]
+fn device_nets_geometry(store: tauri::State<LoadStore>) -> Vec<Vec<Vec<[f64; 2]>>> {
+    let loaded = store.0.lock().unwrap();
+    let ext = &loaded.extraction;
+    ext.device_nets
+        .members
+        .iter()
+        .map(|members| {
+            members
+                .iter()
+                .filter_map(|&i| ext.device_polys.get(i as usize))
+                .map(|p| p.points.clone())
+                .collect()
+        })
+        .collect()
+}
+
 /// Run the switch-level digital sim (H5) over the extracted transistors.
 /// `fixed` is the list of driver nets — `(net_id, value)` for VDD (1),
 /// GND (0), and each input. Returns one logic value per device net.
@@ -141,6 +162,7 @@ pub fn run() {
             net_rings,
             transistors,
             device_net_rings,
+            device_nets_geometry,
             simulate_nets
         ])
         .run(tauri::generate_context!())
