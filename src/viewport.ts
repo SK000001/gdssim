@@ -89,6 +89,81 @@ type GpuLayer = {
 const VERTEX_FLOATS = 5;
 const MSAA_SAMPLES = 4;
 
+/** Signed area of a ring (shoelace); >0 is counter-clockwise. */
+function ringSignedArea(p: [number, number][]): number {
+  let a = 0;
+  for (let i = 0, n = p.length, j = n - 1; i < n; j = i++) {
+    a += p[j][0] * p[i][1] - p[i][0] * p[j][1];
+  }
+  return a * 0.5;
+}
+
+/** Is point (px,py) inside triangle (a,b,c)? Boundary counts as inside. */
+function pointInTri(
+  ax: number, ay: number, bx: number, by: number, cx: number, cy: number,
+  px: number, py: number
+): boolean {
+  const d1 = (px - bx) * (ay - by) - (ax - bx) * (py - by);
+  const d2 = (px - cx) * (by - cy) - (bx - cx) * (py - cy);
+  const d3 = (px - ax) * (cy - ay) - (cx - ax) * (py - ay);
+  const neg = d1 < 0 || d2 < 0 || d3 < 0;
+  const pos = d1 > 0 || d2 > 0 || d3 > 0;
+  return !(neg && pos);
+}
+
+/**
+ * Ear-clipping triangulation of a simple polygon ring, returning local
+ * vertex indices (triples) into `ring`. Good enough for the highlight
+ * fill — the rings here are small and simple (rectangles, regions, and
+ * path-derived waveguides), no holes. A guard bails on degenerate input
+ * rather than looping forever.
+ */
+function triangulateRing(ring: [number, number][]): number[] {
+  const n = ring.length;
+  if (n < 3) return [];
+  const idx: number[] = [];
+  for (let i = 0; i < n; i++) idx.push(i);
+  // Ear clipping assumes CCW; reverse a CW ring (indices stay original).
+  if (ringSignedArea(ring) < 0) idx.reverse();
+
+  const tris: number[] = [];
+  let nv = n;
+  let i = 0;
+  let guard = 0;
+  const maxGuard = 2 * n * n + 16;
+  while (nv > 2 && guard++ < maxGuard) {
+    const a = idx[i % nv];
+    const b = idx[(i + 1) % nv];
+    const c = idx[(i + 2) % nv];
+    const ax = ring[a][0], ay = ring[a][1];
+    const bx = ring[b][0], by = ring[b][1];
+    const cx = ring[c][0], cy = ring[c][1];
+    // Convex corner at b? (CCW cross > 0)
+    const convex = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax) > 0;
+    let ear = convex;
+    if (ear) {
+      for (let k = 0; k < nv; k++) {
+        const v = idx[k];
+        if (v === a || v === b || v === c) continue;
+        if (pointInTri(ax, ay, bx, by, cx, cy, ring[v][0], ring[v][1])) {
+          ear = false;
+          break;
+        }
+      }
+    }
+    if (ear) {
+      tris.push(a, b, c);
+      idx.splice((i + 1) % nv, 1);
+      nv--;
+      i = 0;
+      guard = 0;
+    } else {
+      i++;
+    }
+  }
+  return tris;
+}
+
 export class Viewport {
   private canvas: HTMLCanvasElement;
   private device!: GPUDevice;
@@ -97,8 +172,13 @@ export class Viewport {
   private fillPipeline!: GPURenderPipeline;
   private edgePipeline!: GPURenderPipeline;
   private highlightPipeline!: GPURenderPipeline;
+  private highlightFillPipeline!: GPURenderPipeline;
   private uniformBuf!: GPUBuffer;
   private uniformBg!: GPUBindGroup;
+  // Translucent area fill for the highlight: base projection + a low-alpha
+  // colour, written into its own uniform + bind group.
+  private hiFillBuf!: GPUBuffer;
+  private hiFillBg!: GPUBindGroup;
   // Cached projection matrix (also written to uniformBuf) so the
   // highlight passes can bake a per-pass pixel offset into it.
   private proj = new Float32Array(16);
@@ -120,6 +200,9 @@ export class Viewport {
   private hiVbuf: GPUBuffer | null = null;
   private hiEdges: GPUBuffer | null = null;
   private hiEdgeCount = 0;
+  // Triangulated highlight rings for the translucent fill.
+  private hiTris: GPUBuffer | null = null;
+  private hiTriCount = 0;
   private cam = {
     center: [0, 0] as [number, number],
     halfH: 150,
@@ -282,6 +365,39 @@ export class Viewport {
       return { dx: s.dx, dy: s.dy, color: s.color, buf, bg };
     });
 
+    // Translucent area fill: same highlight shader/uniform, but a
+    // triangle-list pipeline drawn under the outline so the *region*
+    // (not just its border) reads as selected.
+    this.highlightFillPipeline = this.device.createRenderPipeline({
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [hiBgLayout] }),
+      vertex: { module: shader, entryPoint: "vs_highlight", buffers: vertexState.buffers },
+      fragment: {
+        module: shader,
+        entryPoint: "fs_highlight",
+        targets: [
+          {
+            format: this.format,
+            blend: {
+              color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+              alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+            },
+          },
+        ],
+      },
+      primitive: { topology: "triangle-list" },
+      multisample: { count: MSAA_SAMPLES },
+    });
+    this.hiFillBuf = this.device.createBuffer({
+      size: 80,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    // Low-alpha yellow wash; proj (offset 0) refreshed per frame.
+    this.device.queue.writeBuffer(this.hiFillBuf, 64, new Float32Array([1.0, 0.9, 0.3, 0.22]));
+    this.hiFillBg = this.device.createBindGroup({
+      layout: hiBgLayout,
+      entries: [{ binding: 1, resource: { buffer: this.hiFillBuf } }],
+    });
+
     this.attachInput();
     this.resize();
     new ResizeObserver(() => this.resize()).observe(this.canvas);
@@ -296,6 +412,7 @@ export class Viewport {
     this.clearHighlight();
     for (const p of this.hiPasses) p.buf.destroy();
     this.hiPasses = [];
+    this.hiFillBuf?.destroy();
     this.msaaTex?.destroy();
     this.msaaTex = null;
     this.msaaView = null;
@@ -304,15 +421,18 @@ export class Viewport {
   private clearHighlight() {
     this.hiVbuf?.destroy();
     this.hiEdges?.destroy();
+    this.hiTris?.destroy();
     this.hiVbuf = null;
     this.hiEdges = null;
+    this.hiTris = null;
     this.hiEdgeCount = 0;
+    this.hiTriCount = 0;
   }
 
   /**
-   * Highlight one or more polygon rings (database units) as bright
-   * line-loops, or clear with `null`. Used for the picked polygon's
-   * whole net (H3).
+   * Highlight one or more polygon rings (database units): a translucent
+   * area fill plus a bright haloed outline, or clear with `null`. Used
+   * for the picked polygon's whole net (H3) / a device's nets (H4).
    */
   setHighlight(rings: [number, number][][] | null) {
     this.clearHighlight();
@@ -323,6 +443,7 @@ export class Viewport {
     // Interleaved (x, y, r, g, b); colour is unused by fs_highlight.
     const verts = new Float32Array(totalPts * VERTEX_FLOATS);
     const idx = new Uint32Array(totalPts * 2);
+    const tris: number[] = [];
     let base = 0; // vertex offset of the current ring
     let vi = 0; // float cursor
     let ii = 0; // index cursor
@@ -338,6 +459,8 @@ export class Viewport {
         idx[ii++] = base + i;
         idx[ii++] = base + ((i + 1) % n);
       }
+      // Triangulate the ring for the translucent fill (offset to global).
+      for (const t of triangulateRing(ring)) tris.push(base + t);
       base += n;
     }
 
@@ -352,6 +475,16 @@ export class Viewport {
     });
     this.device.queue.writeBuffer(this.hiEdges, 0, idx);
     this.hiEdgeCount = idx.length;
+
+    if (tris.length > 0) {
+      const tarr = new Uint32Array(tris);
+      this.hiTris = this.device.createBuffer({
+        size: tarr.byteLength,
+        usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+      });
+      this.device.queue.writeBuffer(this.hiTris, 0, tarr);
+      this.hiTriCount = tarr.length;
+    }
   }
 
   private releaseLayerBuffers() {
@@ -622,6 +755,16 @@ export class Viewport {
         pass.setVertexBuffer(0, l.vbuf);
         pass.setIndexBuffer(l.edges, "uint32");
         pass.drawIndexed(l.edgeCount);
+      }
+      // Translucent area fill first (under the outline), at the base
+      // projection so it lines up with the geometry.
+      if (this.hiVbuf && this.hiTris && this.hiTriCount > 0) {
+        this.device.queue.writeBuffer(this.hiFillBuf, 0, this.proj);
+        pass.setPipeline(this.highlightFillPipeline);
+        pass.setBindGroup(0, this.hiFillBg);
+        pass.setVertexBuffer(0, this.hiVbuf);
+        pass.setIndexBuffer(this.hiTris, "uint32");
+        pass.drawIndexed(this.hiTriCount);
       }
       if (this.hiVbuf && this.hiEdges && this.hiEdgeCount > 0) {
         pass.setPipeline(this.highlightPipeline);
