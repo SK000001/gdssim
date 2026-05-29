@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 
 use crate::gds::{self, Polygon};
-use crate::tech::Tech;
+use crate::tech::{LayerRole, Tech};
 
 /// Connected-component result over the flattened polygon list.
 #[derive(Debug, Default)]
@@ -82,6 +82,15 @@ pub fn build_nets(polys: &[Polygon], tech: &Tech) -> Nets {
 /// Two polygons are electrically connected if their geometry touches and
 /// the technology allows it across their layers.
 fn connectable(a: &Polygon, b: &Polygon, tech: &Tech) -> bool {
+    // Wells are a classification implant, not a conductor — they carry no
+    // signal net and must never be pulled in (e.g. by a contact dropped
+    // inside the well). Keeping them inert also stops a via from shorting
+    // source/drain together through the surrounding well in H4.
+    if tech.role(a.layer, a.datatype) == LayerRole::NWell
+        || tech.role(b.layer, b.datatype) == LayerRole::NWell
+    {
+        return false;
+    }
     let same_layer = a.layer == b.layer;
     let bridges =
         same_layer || tech.is_via(a.layer, a.datatype) || tech.is_via(b.layer, b.datatype);
@@ -319,6 +328,23 @@ mod tests {
         ];
         let nets = build_nets(&polys, Tech::default_tech());
         assert_eq!(nets.count(), 2);
+    }
+
+    #[test]
+    fn nwell_never_joins_a_net() {
+        // A contact (via) sits inside an nwell and over a diffusion. The
+        // via bridges diffusion↔(its layer), but the well must stay out of
+        // the net — otherwise two contacts in the same well would short.
+        let polys = vec![
+            poly(8, 0, 0.0, 0.0, 100.0, 100.0),  // nwell
+            poly(2, 0, 10.0, 10.0, 40.0, 40.0),  // diffusion under the well
+            poly(3, 0, 15.0, 15.0, 25.0, 25.0),  // contact (via) over both
+        ];
+        let nets = build_nets(&polys, Tech::default_tech());
+        // diffusion + contact merge (2 polys); nwell is its own singleton.
+        assert_ne!(nets.net_of[0], nets.net_of[1], "nwell stays separate");
+        assert_eq!(nets.net_of[1], nets.net_of[2], "diffusion+contact merge");
+        assert_eq!(nets.members[nets.net_of[0] as usize].len(), 1);
     }
 
     #[test]

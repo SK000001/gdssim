@@ -200,6 +200,56 @@ code {
   border-radius: 3px;
 }
 
+.devpanel {
+  position: absolute;
+  bottom: 12px;
+  left: 12px;
+  background: rgba(20, 20, 26, 0.85);
+  border: 1px solid #2a2a30;
+  border-radius: 6px;
+  padding: 0.5rem 0.6rem;
+  max-height: calc(100vh - 80px);
+  overflow-y: auto;
+  z-index: 8;
+  min-width: 210px;
+  max-width: 300px;
+  user-select: none;
+}
+
+.fet-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.22rem 0.3rem;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 0.82rem;
+}
+.fet-row:hover { background: rgba(255, 255, 255, 0.05); }
+.fet-row.active { background: rgba(255, 235, 64, 0.14); }
+
+.fet-kind {
+  font-family: ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+  font-weight: 600;
+  font-size: 0.72rem;
+  padding: 0.05em 0.4em;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.fet-kind.nmos { background: #2d4a8a; color: #cfe0ff; }
+.fet-kind.pmos { background: #7a3a2a; color: #ffd9c9; }
+
+.fet-nets {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+  color: #bbb;
+  font-size: 0.76rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .inspector {
   position: absolute;
   bottom: 12px;

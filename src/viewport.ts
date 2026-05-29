@@ -53,6 +53,18 @@ export type PolygonHit = {
   points: [number, number][];
 };
 
+/** One extracted MOSFET from the `transistors` IPC command (H4). */
+export type Transistor = {
+  kind: "nmos" | "pmos";
+  poly_index: number;
+  diff_index: number;
+  gate_min: [number, number];
+  gate_max: [number, number];
+  gate_net: number;
+  source_net: number | null;
+  drain_net: number | null;
+};
+
 export type Diag = {
   canvasW: number;
   canvasH: number;

@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Viewport, type SceneData, type LayerInfo, type Diag, type PolygonHit } from "./viewport";
+import {
+  Viewport,
+  type SceneData,
+  type LayerInfo,
+  type Diag,
+  type PolygonHit,
+  type Transistor,
+} from "./viewport";
 import "./App.css";
 
 type Summary = {
@@ -28,6 +35,8 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [diag, setDiag] = useState<Diag | null>(null);
   const [selected, setSelected] = useState<PolygonHit | null>(null);
+  const [transistors, setTransistors] = useState<Transistor[]>([]);
+  const [activeFet, setActiveFet] = useState<number | null>(null);
 
   useEffect(() => {
     if (!canvasRef.current) return;
@@ -37,6 +46,7 @@ function App() {
       setLayers(newLayers);
       setHidden(new Set());
       setSelected(null);
+      setActiveFet(null);
     };
     vp.onDiag = (d) => setDiag(d);
     vp.onPick = async (world) => {
@@ -46,6 +56,7 @@ function App() {
           y: world[1],
         });
         setSelected(hit);
+        setActiveFet(null);
         if (!hit) {
           vp.setHighlight(null);
           return;
@@ -91,6 +102,35 @@ function App() {
     [hidden]
   );
 
+  // Click a device row → highlight its gate channel rectangle plus its
+  // gate / source / drain device-nets (H4 refined connectivity).
+  const selectFet = useCallback(
+    async (i: number) => {
+      const t = transistors[i];
+      const vp = viewportRef.current;
+      if (!t || !vp) return;
+      setActiveFet(i);
+      setSelected(null);
+      const rings: [number, number][][] = [
+        [
+          [t.gate_min[0], t.gate_min[1]],
+          [t.gate_max[0], t.gate_min[1]],
+          [t.gate_max[0], t.gate_max[1]],
+          [t.gate_min[0], t.gate_max[1]],
+        ],
+      ];
+      const nets = [t.gate_net, t.source_net, t.drain_net].filter(
+        (n): n is number => n != null
+      );
+      for (const n of nets) {
+        const r = await invoke<[number, number][][]>("device_net_rings", { netId: n });
+        rings.push(...r);
+      }
+      vp.setHighlight(rings);
+    },
+    [transistors]
+  );
+
   async function pickAndLoad() {
     setError(null);
     try {
@@ -111,6 +151,7 @@ function App() {
         top_cell: scene.top_cell,
         cell_names: scene.cell_names,
       });
+      setTransistors(await invoke<Transistor[]>("transistors"));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -130,7 +171,7 @@ function App() {
           Fit (F)
         </button>
         <span className="title">GDSSIM</span>
-        <span className="tag">H3 · nets · click a wire</span>
+        <span className="tag">H4 · transistors · click a device</span>
         <span className="spacer" />
         {loaded && (
           <span className="summary">
@@ -192,6 +233,25 @@ function App() {
               </label>
             );
           })}
+        </div>
+      )}
+
+      {transistors.length > 0 && (
+        <div className="devpanel">
+          <div className="lp-hd">Devices · {transistors.length}</div>
+          {transistors.map((t, i) => (
+            <div
+              key={i}
+              className={"fet-row" + (activeFet === i ? " active" : "")}
+              title="Highlight gate channel + gate/source/drain nets"
+              onClick={() => selectFet(i)}
+            >
+              <span className={"fet-kind " + t.kind}>{t.kind.toUpperCase()}</span>
+              <span className="fet-nets">
+                G{t.gate_net} · S{t.source_net ?? "?"} · D{t.drain_net ?? "?"}
+              </span>
+            </div>
+          ))}
         </div>
       )}
 

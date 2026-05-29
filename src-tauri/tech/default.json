@@ -1,6 +1,6 @@
 {
   "name": "Generic CMOS (default)",
-  "description": "Built-in fallback technology. Maps (layer, datatype) pairs to a display name, RGB colour (0..1), and electrical role. role drives net connectivity: 'via' layers bridge other layers they overlap; 'poly'/'diffusion'/'conductor' connect to same-layer geometry they touch; 'other' (the default) is inert cross-layer. Pairs not listed here fall back to a hash colour, a generated name, and role 'other'. Embedded at build time (include_str!); H9 will load tech files at runtime.",
+  "description": "Built-in fallback technology. Maps (layer, datatype) pairs to a display name, RGB colour (0..1), and electrical role. role drives net connectivity: 'via' layers bridge other layers they overlap; 'poly'/'diffusion'/'conductor' connect to same-layer geometry they touch; 'nwell' carries no net but classifies a poly-over-diffusion gate as PMOS (inside) vs NMOS (outside) in H4; 'other' (the default) is inert cross-layer. Pairs not listed here fall back to a hash colour, a generated name, and role 'other'. Embedded at build time (include_str!); H9 will load tech files at runtime.",
   "layers": [
     { "layer": 0, "datatype": 0, "name": "outline", "color": [0.55, 0.55, 0.55], "role": "other" },
     { "layer": 1, "datatype": 0, "name": "poly",    "color": [0.45, 0.85, 0.40], "role": "poly" },
@@ -9,6 +9,7 @@
     { "layer": 4, "datatype": 0, "name": "metal1",  "color": [0.90, 0.40, 0.40], "role": "conductor" },
     { "layer": 5, "datatype": 0, "name": "metal2",  "color": [0.40, 0.85, 0.85], "role": "conductor" },
     { "layer": 6, "datatype": 0, "name": "metal3",  "color": [0.85, 0.50, 0.85], "role": "conductor" },
-    { "layer": 7, "datatype": 0, "name": "via",     "color": [0.95, 0.65, 0.30], "role": "via" }
+    { "layer": 7, "datatype": 0, "name": "via",     "color": [0.95, 0.65, 0.30], "role": "via" },
+    { "layer": 8, "datatype": 0, "name": "nwell",   "color": [0.40, 0.40, 0.30], "role": "nwell" }
   ]
 }

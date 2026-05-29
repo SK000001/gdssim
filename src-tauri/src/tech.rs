@@ -14,9 +14,12 @@ use std::sync::OnceLock;
 
 use serde::Deserialize;
 
-/// Electrical role of a layer — drives net connectivity (H3) and, later,
+/// Electrical role of a layer — drives net connectivity (H3) and
 /// transistor extraction (H4). `Via` layers bridge other layers they
 /// overlap; `Poly` over `Diffusion` is a transistor (not a connection).
+/// `NWell` is a body-tie / classification layer: it carries no signal
+/// net but a `Poly`×`Diffusion` gate sitting inside an `NWell` is a
+/// PMOS, outside it an NMOS (H4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LayerRole {
@@ -24,6 +27,7 @@ pub enum LayerRole {
     Via,
     Poly,
     Diffusion,
+    NWell,
     #[default]
     Other,
 }

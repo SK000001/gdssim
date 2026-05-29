@@ -9,6 +9,7 @@
 mod gds;
 mod geometry;
 mod tech;
+mod transistors;
 mod viewport;
 
 use std::path::PathBuf;
@@ -16,13 +17,15 @@ use std::sync::Mutex;
 
 use gds::Polygon;
 use geometry::Nets;
+use transistors::{Extraction, Transistor};
 
-/// The currently-loaded GDS, retained so click hit-testing (H2d) and
-/// net queries (H3) can run without re-parsing.
+/// The currently-loaded GDS, retained so click hit-testing (H2d), net
+/// queries (H3), and transistor lookup (H4) can run without re-parsing.
 #[derive(Default)]
 struct Loaded {
     polys: Vec<Polygon>,
     nets: Nets,
+    extraction: Extraction,
 }
 
 #[derive(Default)]
@@ -47,10 +50,42 @@ fn load_gds(path: String, store: tauri::State<LoadStore>) -> Result<viewport::Sc
         })?
         .map_err(|e| e.to_string())?;
     let scene = viewport::build_scene(&info);
-    let nets = geometry::build_nets(&info.polygons, tech::Tech::default_tech());
-    log::info!("built {} nets from {} polygons", nets.count(), info.polygons.len());
-    *store.0.lock().unwrap() = Loaded { polys: info.polygons, nets };
+    let tech = tech::Tech::default_tech();
+    let nets = geometry::build_nets(&info.polygons, tech);
+    let extraction = transistors::extract(&info.polygons, tech);
+    log::info!(
+        "built {} nets + {} transistors from {} polygons",
+        nets.count(),
+        extraction.transistors.len(),
+        info.polygons.len()
+    );
+    *store.0.lock().unwrap() = Loaded { polys: info.polygons, nets, extraction };
     Ok(scene)
+}
+
+/// The transistors extracted from the loaded layout (H4).
+#[tauri::command]
+fn transistors(store: tauri::State<LoadStore>) -> Vec<Transistor> {
+    store.0.lock().unwrap().extraction.transistors.clone()
+}
+
+/// All polygon rings of a *device* net (H4 refined connectivity, where a
+/// gated diffusion is split so source / drain / internal nodes are
+/// distinct). Lets the UI light up a transistor's source, drain, or gate
+/// net independently — which the H3 `net_rings` can't, since it treats a
+/// whole diffusion as one node.
+#[tauri::command]
+fn device_net_rings(net_id: u32, store: tauri::State<LoadStore>) -> Vec<Vec<[f64; 2]>> {
+    let loaded = store.0.lock().unwrap();
+    let ext = &loaded.extraction;
+    let Some(members) = ext.device_nets.members.get(net_id as usize) else {
+        return Vec::new();
+    };
+    members
+        .iter()
+        .filter_map(|&i| ext.device_polys.get(i as usize))
+        .map(|p| p.points.clone())
+        .collect()
 }
 
 /// Hit-test a world-space click against the loaded polygons. Returns
@@ -83,7 +118,14 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(LoadStore::default())
-        .invoke_handler(tauri::generate_handler![ping, load_gds, hit_test, net_rings])
+        .invoke_handler(tauri::generate_handler![
+            ping,
+            load_gds,
+            hit_test,
+            net_rings,
+            transistors,
+            device_net_rings
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
