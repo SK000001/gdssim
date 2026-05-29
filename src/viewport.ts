@@ -99,6 +99,19 @@ export class Viewport {
   private highlightPipeline!: GPURenderPipeline;
   private uniformBuf!: GPUBuffer;
   private uniformBg!: GPUBindGroup;
+  // Cached projection matrix (also written to uniformBuf) so the
+  // highlight passes can bake a per-pass pixel offset into it.
+  private proj = new Float32Array(16);
+  private hiScratch = new Float32Array(16);
+  // One offset pass of the highlight outline: a screen-space (dx,dy) in
+  // CSS pixels and a colour, with its own uniform buffer + bind group.
+  private hiPasses: {
+    dx: number;
+    dy: number;
+    color: [number, number, number, number];
+    buf: GPUBuffer;
+    bg: GPUBindGroup;
+  }[] = [];
   private msaaTex: GPUTexture | null = null;
   private msaaView: GPUTextureView | null = null;
   private gpuLayers: GpuLayer[] = [];
@@ -205,16 +218,68 @@ export class Viewport {
       multisample: { count: MSAA_SAMPLES },
     });
 
+    // Highlight: its own bind group (binding 1 = per-pass projection +
+    // colour) and an alpha-blended line pipeline. Drawn in several
+    // pixel-offset passes (dark halo + bright core) for a thick,
+    // high-contrast outline — see the pass list below and frame().
+    const hiBgLayout = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 1,
+          visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+          buffer: { type: "uniform" },
+        },
+      ],
+    });
     this.highlightPipeline = this.device.createRenderPipeline({
-      layout: pipelineLayout,
-      vertex: vertexState,
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [hiBgLayout] }),
+      vertex: { module: shader, entryPoint: "vs_highlight", buffers: vertexState.buffers },
       fragment: {
         module: shader,
         entryPoint: "fs_highlight",
-        targets: [{ format: this.format }],
+        targets: [
+          {
+            format: this.format,
+            blend: {
+              color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+              alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+            },
+          },
+        ],
       },
       primitive: { topology: "line-list" },
       multisample: { count: MSAA_SAMPLES },
+    });
+
+    // Build the offset-pass list: a dark halo ring (8 directions) drawn
+    // first, then a bright core (centre + 4 directions) on top. Each gets
+    // an 80-byte uniform (mat4 proj + vec4 colour) and a bind group.
+    const dark: [number, number, number, number] = [0.03, 0.03, 0.06, 0.92];
+    const core: [number, number, number, number] = [1.0, 0.95, 0.25, 1.0];
+    const HALO = 2.6;
+    const CORE = 1.0;
+    const ring8 = [
+      [1, 0], [-1, 0], [0, 1], [0, -1],
+      [1, 1], [1, -1], [-1, 1], [-1, -1],
+    ];
+    const ring4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+    const specs: { dx: number; dy: number; color: [number, number, number, number] }[] = [];
+    for (const [x, y] of ring8) specs.push({ dx: x * HALO, dy: y * HALO, color: dark });
+    specs.push({ dx: 0, dy: 0, color: core });
+    for (const [x, y] of ring4) specs.push({ dx: x * CORE, dy: y * CORE, color: core });
+    this.hiPasses = specs.map((s) => {
+      const buf = this.device.createBuffer({
+        size: 80,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+      // Colour is constant per pass; write it once. The proj (offset 0) is
+      // refreshed every frame from the live camera.
+      this.device.queue.writeBuffer(buf, 64, new Float32Array(s.color));
+      const bg = this.device.createBindGroup({
+        layout: hiBgLayout,
+        entries: [{ binding: 1, resource: { buffer: buf } }],
+      });
+      return { dx: s.dx, dy: s.dy, color: s.color, buf, bg };
     });
 
     this.attachInput();
@@ -229,6 +294,8 @@ export class Viewport {
     this.destroyed = true;
     this.releaseLayerBuffers();
     this.clearHighlight();
+    for (const p of this.hiPasses) p.buf.destroy();
+    this.hiPasses = [];
     this.msaaTex?.destroy();
     this.msaaTex = null;
     this.msaaView = null;
@@ -418,13 +485,13 @@ export class Viewport {
     const bottom = cy - hh, top = cy + hh;
     const rl = right - left;
     const tb = top - bottom;
-    const m = new Float32Array([
+    this.proj.set([
        2 / rl,            0,                  0, 0,
        0,                 2 / tb,             0, 0,
        0,                 0,                  1, 0,
       -(right + left) / rl, -(top + bottom) / tb, 0, 1,
     ]);
-    this.device.queue.writeBuffer(this.uniformBuf, 0, m);
+    this.device.queue.writeBuffer(this.uniformBuf, 0, this.proj);
   }
 
   // -- input --
@@ -560,7 +627,20 @@ export class Viewport {
         pass.setPipeline(this.highlightPipeline);
         pass.setVertexBuffer(0, this.hiVbuf);
         pass.setIndexBuffer(this.hiEdges, "uint32");
-        pass.drawIndexed(this.hiEdgeCount);
+        const dpr = window.devicePixelRatio || 1;
+        const cw = this.canvas.width || 1;
+        const ch = this.canvas.height || 1;
+        for (const p of this.hiPasses) {
+          // Bake the screen-space pixel offset into the projection's
+          // clip-space translation so the outline keeps constant
+          // thickness regardless of zoom. Y is flipped (pixels go down).
+          this.hiScratch.set(this.proj);
+          this.hiScratch[12] += ((p.dx * dpr) / cw) * 2;
+          this.hiScratch[13] -= ((p.dy * dpr) / ch) * 2;
+          this.device.queue.writeBuffer(p.buf, 0, this.hiScratch);
+          pass.setBindGroup(0, p.bg);
+          pass.drawIndexed(this.hiEdgeCount);
+        }
       }
       pass.end();
       this.device.queue.submit([enc.finish()]);

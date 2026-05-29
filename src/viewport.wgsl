@@ -35,9 +35,24 @@ fn fs_edge(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(bright, 1.0);
 }
 
+// Highlight is drawn as several offset passes (a dark halo under a bright
+// core) so it reads against any layer colour and at any zoom. Each pass
+// supplies its own colour and a projection with the pixel offset already
+// baked into the translation, so the outline thickness is constant in
+// screen space.
+struct HiUniforms {
+    proj: mat4x4<f32>,
+    color: vec4<f32>,
+};
+
+@group(0) @binding(1) var<uniform> hi: HiUniforms;
+
+@vertex
+fn vs_highlight(in: VsIn) -> @builtin(position) vec4<f32> {
+    return hi.proj * vec4<f32>(in.pos, 0.0, 1.0);
+}
+
 @fragment
-fn fs_highlight(in: VsOut) -> @location(0) vec4<f32> {
-    // Selection outline: a fixed bright colour, independent of the
-    // polygon's layer colour, so the picked feature always stands out.
-    return vec4<f32>(1.0, 0.92, 0.25, 1.0);
+fn fs_highlight() -> @location(0) vec4<f32> {
+    return hi.color;
 }
