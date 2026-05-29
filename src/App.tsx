@@ -12,6 +12,9 @@ type Summary = {
   cell_names: string[];
 };
 
+/** Stable key for a (layer, datatype) technology style. */
+const styleKey = (layer: number, datatype: number) => `${layer}/${datatype}`;
+
 function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const viewportRef = useRef<Viewport | null>(null);
@@ -19,7 +22,8 @@ function App() {
   const [loaded, setLoaded] = useState<Summary | null>(null);
   const [loadedPath, setLoadedPath] = useState<string | null>(null);
   const [layers, setLayers] = useState<LayerInfo[]>([]);
-  const [hidden, setHidden] = useState<Set<number>>(new Set());
+  // Visibility is keyed per (layer, datatype) style — see styleKey().
+  const [hidden, setHidden] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [diag, setDiag] = useState<Diag | null>(null);
@@ -67,12 +71,13 @@ function App() {
   }, []);
 
   const toggleLayer = useCallback(
-    (layer: number) => {
+    (layer: number, datatype: number) => {
+      const key = styleKey(layer, datatype);
       const next = new Set(hidden);
-      if (next.has(layer)) next.delete(layer);
-      else next.add(layer);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
       setHidden(next);
-      viewportRef.current?.setLayerVisible(layer, !next.has(layer));
+      viewportRef.current?.setLayerVisible(layer, datatype, !next.has(key));
     },
     [hidden]
   );
@@ -116,7 +121,7 @@ function App() {
           Fit (F)
         </button>
         <span className="title">GDSSIM</span>
-        <span className="tag">H2d · click to inspect</span>
+        <span className="tag">H2d · tech-file colours</span>
         <span className="spacer" />
         {loaded && (
           <span className="summary">
@@ -156,19 +161,24 @@ function App() {
         <div className="layerpanel">
           <div className="lp-hd">Layers</div>
           {layers.map((l) => {
-            const visible = !hidden.has(l.layer);
+            const key = styleKey(l.layer, l.datatype);
+            const visible = !hidden.has(key);
             const rgb = `rgb(${Math.round(l.color[0] * 255)}, ${Math.round(l.color[1] * 255)}, ${Math.round(l.color[2] * 255)})`;
             return (
               <label
-                key={l.layer}
+                key={key}
                 className={"lp-row" + (visible ? "" : " off")}
+                title={`layer ${l.layer} · datatype ${l.datatype}`}
                 onClick={(e) => {
                   e.preventDefault();
-                  toggleLayer(l.layer);
+                  toggleLayer(l.layer, l.datatype);
                 }}
               >
                 <span className="lp-sw" style={{ background: rgb }} />
-                <span className="lp-num">L{l.layer}</span>
+                <span className="lp-name">{l.name}</span>
+                <span className="lp-num">
+                  {l.layer}/{l.datatype}
+                </span>
                 <span className="lp-count">{l.polygon_count}</span>
               </label>
             );
@@ -192,6 +202,8 @@ function App() {
             </button>
           </div>
           <dl className="insp-grid">
+            <dt>Style</dt>
+            <dd>{selected.name}</dd>
             <dt>Layer</dt>
             <dd>{selected.layer}</dd>
             <dt>Datatype</dt>

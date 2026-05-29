@@ -1,0 +1,14 @@
+{
+  "name": "Generic CMOS (default)",
+  "description": "Built-in fallback technology. Maps (layer, datatype) pairs to a display name and RGB colour (0..1). Pairs not listed here fall back to a deterministic hash colour and a generated name. This file is embedded at build time (include_str!); the H9 milestone will load tech files at runtime.",
+  "layers": [
+    { "layer": 0, "datatype": 0, "name": "outline", "color": [0.55, 0.55, 0.55] },
+    { "layer": 1, "datatype": 0, "name": "poly",    "color": [0.45, 0.85, 0.40] },
+    { "layer": 2, "datatype": 0, "name": "active",  "color": [0.30, 0.55, 0.95] },
+    { "layer": 3, "datatype": 0, "name": "contact", "color": [0.95, 0.85, 0.30] },
+    { "layer": 4, "datatype": 0, "name": "metal1",  "color": [0.90, 0.40, 0.40] },
+    { "layer": 5, "datatype": 0, "name": "metal2",  "color": [0.40, 0.85, 0.85] },
+    { "layer": 6, "datatype": 0, "name": "metal3",  "color": [0.85, 0.50, 0.85] },
+    { "layer": 7, "datatype": 0, "name": "via",     "color": [0.95, 0.65, 0.30] }
+  ]
+}

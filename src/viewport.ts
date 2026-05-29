@@ -12,6 +12,8 @@ import shaderSrc from "./viewport.wgsl?raw";
 
 export type LayerData = {
   layer: number;
+  datatype: number;
+  name: string;
   color: [number, number, number];
   polygon_count: number;
   vertices: number[];
@@ -30,6 +32,8 @@ export type SceneData = {
 
 export type LayerInfo = {
   layer: number;
+  datatype: number;
+  name: string;
   color: [number, number, number];
   polygon_count: number;
 };
@@ -39,6 +43,7 @@ export type PolygonHit = {
   index: number;
   layer: number;
   datatype: number;
+  name: string;
   point_count: number;
   bbox_min: [number, number];
   bbox_max: [number, number];
@@ -58,6 +63,7 @@ export type Diag = {
 
 type GpuLayer = {
   layer: number;
+  datatype: number;
   visible: boolean;
   vbuf: GPUBuffer;
   tris: GPUBuffer;
@@ -290,6 +296,7 @@ export class Viewport {
 
       this.gpuLayers.push({
         layer: ld.layer,
+        datatype: ld.datatype,
         visible: true,
         vbuf,
         tris: tribuf,
@@ -303,20 +310,18 @@ export class Viewport {
     this.onSceneChanged?.(this.layerInfos(s));
   }
 
-  layers(): number[] {
-    return this.gpuLayers.map((l) => l.layer);
-  }
-
   private layerInfos(s: SceneData): LayerInfo[] {
     return s.layers.map((l) => ({
       layer: l.layer,
+      datatype: l.datatype,
+      name: l.name,
       color: l.color,
       polygon_count: l.polygon_count,
     }));
   }
 
-  setLayerVisible(layer: number, visible: boolean) {
-    const l = this.gpuLayers.find((x) => x.layer === layer);
+  setLayerVisible(layer: number, datatype: number, visible: boolean) {
+    const l = this.gpuLayers.find((x) => x.layer === layer && x.datatype === datatype);
     if (l) l.visible = visible;
   }
 

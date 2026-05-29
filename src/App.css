@@ -133,7 +133,8 @@ button.primary:hover { background: #355aa3; border-color: #4a72c8; }
   max-height: calc(100vh - 80px);
   overflow-y: auto;
   z-index: 8;
-  min-width: 140px;
+  min-width: 190px;
+  max-width: 280px;
   user-select: none;
 }
 
@@ -167,16 +168,28 @@ button.primary:hover { background: #355aa3; border-color: #4a72c8; }
   flex-shrink: 0;
 }
 
+.lp-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #ddd;
+}
+
 .lp-num {
   font-family: ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
-  color: #ddd;
-  min-width: 36px;
+  color: #999;
+  font-size: 0.78rem;
+  flex-shrink: 0;
 }
 
 .lp-count {
-  margin-left: auto;
   color: #888;
   font-size: 0.78rem;
+  min-width: 28px;
+  text-align: right;
+  flex-shrink: 0;
 }
 
 code {

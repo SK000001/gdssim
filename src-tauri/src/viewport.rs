@@ -13,29 +13,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::gds::{self, LoadInfo, Polygon};
-
-/// Deterministic colour per GDS layer. H2c-followup will swap this
-/// for a JSON technology file (mapping (layer, datatype) → name + colour).
-fn layer_color(layer: i16) -> [f32; 3] {
-    const PALETTE: [[f32; 3]; 8] = [
-        [0.55, 0.55, 0.55], // 0
-        [0.45, 0.85, 0.40], // 1  poly
-        [0.30, 0.55, 0.95], // 2  active
-        [0.95, 0.85, 0.30], // 3  contact
-        [0.90, 0.40, 0.40], // 4  metal1
-        [0.40, 0.85, 0.85], // 5  metal2
-        [0.85, 0.50, 0.85], // 6  metal3
-        [0.95, 0.65, 0.30], // 7  via
-    ];
-    if (0..PALETTE.len() as i16).contains(&layer) {
-        return PALETTE[layer as usize];
-    }
-    let h = (layer as i32 as u32).wrapping_mul(2654435761);
-    let r = ((h >> 16) & 0xff) as f32 / 255.0;
-    let g = ((h >> 8) & 0xff) as f32 / 255.0;
-    let b = (h & 0xff) as f32 / 255.0;
-    [0.4 + 0.5 * r, 0.4 + 0.5 * g, 0.4 + 0.5 * b]
-}
+use crate::tech::Tech;
 
 #[derive(Default)]
 struct LayerBuf {
@@ -45,10 +23,15 @@ struct LayerBuf {
     polygon_count: usize,
 }
 
-/// Per-layer GPU-ready buffers.
+/// Per-(layer, datatype) GPU-ready buffers. Grouping by the pair (not
+/// just the layer) matches how technology files distinguish styles —
+/// e.g. layer 1 datatype 0 "active drawing" vs datatype 1 "active label".
 #[derive(Debug, Serialize)]
 pub struct LayerData {
     pub layer: i16,
+    pub datatype: i16,
+    /// Display name from the technology file (or a generated fallback).
+    pub name: String,
     pub color: [f32; 3],
     pub polygon_count: usize,
     /// Interleaved float32: x, y, r, g, b per vertex.
@@ -78,6 +61,8 @@ pub struct PolygonHit {
     pub index: usize,
     pub layer: i16,
     pub datatype: i16,
+    /// Style name from the technology file (or a generated fallback).
+    pub name: String,
     pub point_count: usize,
     pub bbox_min: [f64; 2],
     pub bbox_max: [f64; 2],
@@ -103,10 +88,12 @@ pub fn hit_test(polys: &[Polygon], x: f64, y: f64) -> Option<PolygonHit> {
     let (index, area) = best?;
     let poly = &polys[index];
     let bb = gds::polygon_bbox(&poly.points);
+    let style = Tech::default_tech().resolve(poly.layer, poly.datatype);
     Some(PolygonHit {
         index,
         layer: poly.layer,
         datatype: poly.datatype,
+        name: style.name,
         point_count: poly.points.len(),
         bbox_min: bb.min,
         bbox_max: bb.max,
@@ -117,8 +104,11 @@ pub fn hit_test(polys: &[Polygon], x: f64, y: f64) -> Option<PolygonHit> {
 
 pub fn build_scene(info: &LoadInfo) -> Scene {
     let polys = &info.polygons;
+    let tech = Tech::default_tech();
     let bbox = gds::bbox(polys);
-    let mut by_layer: BTreeMap<i16, LayerBuf> = BTreeMap::new();
+    // Group by (layer, datatype) so the frontend can toggle / colour
+    // each technology style independently. BTreeMap → stable sorted order.
+    let mut by_style: BTreeMap<(i16, i16), LayerBuf> = BTreeMap::new();
 
     for p in polys {
         if p.points.len() < 3 {
@@ -134,9 +124,9 @@ pub fn build_scene(info: &LoadInfo) -> Scene {
             continue;
         };
 
-        let entry = by_layer.entry(p.layer).or_default();
+        let entry = by_style.entry((p.layer, p.datatype)).or_default();
         let base = (entry.vertices.len() / 5) as u32;
-        let [r, g, b] = layer_color(p.layer);
+        let [r, g, b] = tech.color(p.layer, p.datatype);
         for pt in &p.points {
             entry.vertices.push(pt[0] as f32);
             entry.vertices.push(pt[1] as f32);
@@ -156,16 +146,21 @@ pub fn build_scene(info: &LoadInfo) -> Scene {
         entry.polygon_count += 1;
     }
 
-    let polygon_count = by_layer.values().map(|b| b.polygon_count).sum();
-    let layers: Vec<LayerData> = by_layer
+    let polygon_count = by_style.values().map(|b| b.polygon_count).sum();
+    let layers: Vec<LayerData> = by_style
         .into_iter()
-        .map(|(layer, b)| LayerData {
-            layer,
-            color: layer_color(layer),
-            polygon_count: b.polygon_count,
-            vertices: b.vertices,
-            triangle_indices: b.triangle_indices,
-            edge_indices: b.edge_indices,
+        .map(|((layer, datatype), b)| {
+            let style = tech.resolve(layer, datatype);
+            LayerData {
+                layer,
+                datatype,
+                name: style.name,
+                color: style.color,
+                polygon_count: b.polygon_count,
+                vertices: b.vertices,
+                triangle_indices: b.triangle_indices,
+                edge_indices: b.edge_indices,
+            }
         })
         .collect();
 

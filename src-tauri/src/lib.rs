@@ -7,6 +7,7 @@
 //! back via the `load_gds` command.
 
 mod gds;
+mod tech;
 mod viewport;
 
 use std::path::PathBuf;
