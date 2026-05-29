@@ -48,6 +48,8 @@ export type PolygonHit = {
   bbox_min: [number, number];
   bbox_max: [number, number];
   area: number;
+  net_id: number;
+  net_size: number;
   points: [number, number][];
 };
 
@@ -228,23 +230,38 @@ export class Viewport {
     this.hiEdgeCount = 0;
   }
 
-  /** Highlight a polygon ring (database units), or clear with `null`. */
-  setHighlight(ring: [number, number][] | null) {
+  /**
+   * Highlight one or more polygon rings (database units) as bright
+   * line-loops, or clear with `null`. Used for the picked polygon's
+   * whole net (H3).
+   */
+  setHighlight(rings: [number, number][][] | null) {
     this.clearHighlight();
-    if (!ring || ring.length < 2) return;
-    const n = ring.length;
+    if (!rings || rings.length === 0) return;
+    const totalPts = rings.reduce((s, r) => s + r.length, 0);
+    if (totalPts < 2) return;
+
     // Interleaved (x, y, r, g, b); colour is unused by fs_highlight.
-    const verts = new Float32Array(n * VERTEX_FLOATS);
-    for (let i = 0; i < n; i++) {
-      verts[i * VERTEX_FLOATS] = ring[i][0];
-      verts[i * VERTEX_FLOATS + 1] = ring[i][1];
+    const verts = new Float32Array(totalPts * VERTEX_FLOATS);
+    const idx = new Uint32Array(totalPts * 2);
+    let base = 0; // vertex offset of the current ring
+    let vi = 0; // float cursor
+    let ii = 0; // index cursor
+    for (const ring of rings) {
+      const n = ring.length;
+      for (let i = 0; i < n; i++) {
+        verts[vi++] = ring[i][0];
+        verts[vi++] = ring[i][1];
+        vi += 3; // skip r,g,b
+      }
+      // Closed line-loop within this ring: (base+i → base+(i+1)%n).
+      for (let i = 0; i < n; i++) {
+        idx[ii++] = base + i;
+        idx[ii++] = base + ((i + 1) % n);
+      }
+      base += n;
     }
-    // Closed line-loop: pairs (i → (i+1) mod n).
-    const idx = new Uint32Array(n * 2);
-    for (let i = 0; i < n; i++) {
-      idx[i * 2] = i;
-      idx[i * 2 + 1] = (i + 1) % n;
-    }
+
     this.hiVbuf = this.device.createBuffer({
       size: verts.byteLength,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,

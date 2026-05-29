@@ -14,7 +14,22 @@ use std::sync::OnceLock;
 
 use serde::Deserialize;
 
-/// One style row: a (layer, datatype) pair with a name and RGB colour.
+/// Electrical role of a layer — drives net connectivity (H3) and, later,
+/// transistor extraction (H4). `Via` layers bridge other layers they
+/// overlap; `Poly` over `Diffusion` is a transistor (not a connection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LayerRole {
+    Conductor,
+    Via,
+    Poly,
+    Diffusion,
+    #[default]
+    Other,
+}
+
+/// One style row: a (layer, datatype) pair with a name, RGB colour, and
+/// electrical role.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LayerStyle {
     pub layer: i16,
@@ -22,6 +37,8 @@ pub struct LayerStyle {
     pub name: String,
     /// RGB, each component 0..1.
     pub color: [f32; 3],
+    #[serde(default)]
+    pub role: LayerRole,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,6 +105,20 @@ impl Tech {
             },
         }
     }
+
+    /// Electrical role of a (layer, datatype); `Other` when unlisted.
+    pub fn role(&self, layer: i16, datatype: i16) -> LayerRole {
+        self.map
+            .get(&(layer, datatype))
+            .map(|s| s.role)
+            .unwrap_or_default()
+    }
+
+    /// Whether this (layer, datatype) bridges layers it overlaps (a
+    /// contact / via).
+    pub fn is_via(&self, layer: i16, datatype: i16) -> bool {
+        self.role(layer, datatype) == LayerRole::Via
+    }
 }
 
 fn fallback_name(layer: i16, datatype: i16) -> String {
@@ -120,6 +151,12 @@ mod tests {
         assert_eq!(poly.color, [0.45, 0.85, 0.40]);
         // color() agrees with resolve() for a known pair.
         assert_eq!(t.color(1, 0), poly.color);
+        // roles parsed from default.json.
+        assert_eq!(t.role(1, 0), LayerRole::Poly);
+        assert_eq!(t.role(2, 0), LayerRole::Diffusion);
+        assert!(t.is_via(3, 0)); // contact
+        assert!(t.is_via(7, 0)); // via
+        assert!(!t.is_via(4, 0)); // metal1 is a conductor
     }
 
     #[test]
@@ -133,5 +170,8 @@ mod tests {
         assert_eq!(t.resolve(42, 0).name, "layer 42");
         // Fallback is deterministic.
         assert_eq!(t.color(42, 0), fallback_color(42));
+        // Unknown pairs are role Other (inert cross-layer).
+        assert_eq!(t.role(42, 0), LayerRole::Other);
+        assert!(!t.is_via(42, 0));
     }
 }

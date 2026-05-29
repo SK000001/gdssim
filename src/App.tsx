@@ -46,7 +46,16 @@ function App() {
           y: world[1],
         });
         setSelected(hit);
-        vp.setHighlight(hit ? hit.points : null);
+        if (!hit) {
+          vp.setHighlight(null);
+          return;
+        }
+        // Highlight the whole electrically-connected net, not just the
+        // clicked polygon (H3).
+        const rings = await invoke<[number, number][][]>("net_rings", {
+          netId: hit.net_id,
+        });
+        vp.setHighlight(rings.length > 0 ? rings : [hit.points]);
       } catch (e) {
         setError(String(e));
       }
@@ -121,7 +130,7 @@ function App() {
           Fit (F)
         </button>
         <span className="title">GDSSIM</span>
-        <span className="tag">H2d · tech-file colours</span>
+        <span className="tag">H3 · nets · click a wire</span>
         <span className="spacer" />
         {loaded && (
           <span className="summary">
@@ -208,6 +217,11 @@ function App() {
             <dd>{selected.layer}</dd>
             <dt>Datatype</dt>
             <dd>{selected.datatype}</dd>
+            <dt>Net</dt>
+            <dd>
+              #{selected.net_id}
+              {selected.net_size > 1 ? ` (${selected.net_size} polys)` : ""}
+            </dd>
             <dt>Vertices</dt>
             <dd>{selected.point_count}</dd>
             <dt>Area</dt>
@@ -236,7 +250,7 @@ function App() {
         <div className="overlay">
           <p>Open a <code>.gds</code> file to start.</p>
           <p className="muted">
-            Left click = inspect · wheel = zoom · middle drag = pan · <code>F</code> = fit · <code>+/-</code> = step zoom
+            Left click = inspect + highlight net · wheel = zoom · middle drag = pan · <code>F</code> = fit · <code>+/-</code> = step zoom
           </p>
           {loadedPath && <p className="muted">Last picked: {loadedPath}</p>}
         </div>

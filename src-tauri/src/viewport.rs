@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::gds::{self, LoadInfo, Polygon};
+use crate::geometry::Nets;
 use crate::tech::Tech;
 
 #[derive(Default)]
@@ -67,6 +68,10 @@ pub struct PolygonHit {
     pub bbox_min: [f64; 2],
     pub bbox_max: [f64; 2],
     pub area: f64,
+    /// Net id this polygon belongs to (H3 electrical graph).
+    pub net_id: u32,
+    /// Number of polygons in that net.
+    pub net_size: usize,
     /// Ring vertices for the highlight outline.
     pub points: Vec<[f64; 2]>,
 }
@@ -74,7 +79,7 @@ pub struct PolygonHit {
 /// Find the polygon under world point `(x, y)`. When several overlap,
 /// the smallest-area one wins — that's almost always the most specific
 /// feature the user meant to click (e.g. a contact inside a metal pad).
-pub fn hit_test(polys: &[Polygon], x: f64, y: f64) -> Option<PolygonHit> {
+pub fn hit_test(polys: &[Polygon], nets: &Nets, x: f64, y: f64) -> Option<PolygonHit> {
     let p = [x, y];
     let mut best: Option<(usize, f64)> = None;
     for (i, poly) in polys.iter().enumerate() {
@@ -89,6 +94,8 @@ pub fn hit_test(polys: &[Polygon], x: f64, y: f64) -> Option<PolygonHit> {
     let poly = &polys[index];
     let bb = gds::polygon_bbox(&poly.points);
     let style = Tech::default_tech().resolve(poly.layer, poly.datatype);
+    let net_id = nets.net_of.get(index).copied().unwrap_or(0);
+    let net_size = nets.members.get(net_id as usize).map_or(1, |m| m.len());
     Some(PolygonHit {
         index,
         layer: poly.layer,
@@ -98,6 +105,8 @@ pub fn hit_test(polys: &[Polygon], x: f64, y: f64) -> Option<PolygonHit> {
         bbox_min: bb.min,
         bbox_max: bb.max,
         area,
+        net_id,
+        net_size,
         points: poly.points.clone(),
     })
 }
@@ -191,25 +200,28 @@ mod tests {
         // A big metal pad (layer 4) with a small contact (layer 3) inside it.
         let polys = vec![
             rect(4, 0, 0.0, 0.0, 100.0, 100.0),
-            rect(3, 7, 40.0, 40.0, 60.0, 60.0),
+            rect(3, 0, 40.0, 40.0, 60.0, 60.0),
         ];
+        let nets = crate::geometry::build_nets(&polys, Tech::default_tech());
 
         // Click inside the contact → smallest-area wins (the contact).
-        let hit = hit_test(&polys, 50.0, 50.0).expect("hit");
+        let hit = hit_test(&polys, &nets, 50.0, 50.0).expect("hit");
         assert_eq!(hit.index, 1);
         assert_eq!(hit.layer, 3);
-        assert_eq!(hit.datatype, 7);
         assert_eq!(hit.point_count, 4);
         assert!((hit.area - 400.0).abs() < 1e-9);
         assert_eq!(hit.bbox_min, [40.0, 40.0]);
         assert_eq!(hit.bbox_max, [60.0, 60.0]);
+        // The contact (via) bridges to the pad → both share one net.
+        assert_eq!(hit.net_id, nets.net_of[0]);
+        assert_eq!(hit.net_size, 2);
 
         // Click in the pad but outside the contact → the pad.
-        let hit = hit_test(&polys, 10.0, 10.0).expect("hit");
+        let hit = hit_test(&polys, &nets, 10.0, 10.0).expect("hit");
         assert_eq!(hit.index, 0);
         assert_eq!(hit.layer, 4);
 
         // Click outside everything → miss.
-        assert!(hit_test(&polys, 200.0, 200.0).is_none());
+        assert!(hit_test(&polys, &nets, 200.0, 200.0).is_none());
     }
 }
