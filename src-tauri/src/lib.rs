@@ -6,7 +6,8 @@
 //! triangulation, geometry/net processing) and ships ready-to-upload
 //! vertex/index buffers back via the `load_gds` command.
 
-mod gds;
+pub mod celllib;
+pub mod gds;
 mod geometry;
 mod sim;
 mod tech;

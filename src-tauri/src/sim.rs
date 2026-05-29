@@ -73,9 +73,11 @@ pub fn simulate(
     fixed: &HashMap<u32, Logic>,
 ) -> Vec<Logic> {
     let mut val = vec![Logic::X; net_count];
+    let mut is_fixed = vec![false; net_count];
     for (&n, &v) in fixed {
         if (n as usize) < net_count {
             val[n as usize] = v;
+            is_fixed[n as usize] = true;
         }
     }
 
@@ -125,10 +127,17 @@ pub fn simulate(
             .map(|(&n, _)| n as usize)
             .collect();
 
-        let strong_one = flood(&strong, &one_src, net_count);
-        let strong_zero = flood(&strong, &zero_src, net_count);
-        let maybe_one = flood(&maybe, &one_src, net_count);
-        let maybe_zero = flood(&maybe, &zero_src, net_count);
+        // A fixed net is a flood barrier: it can seed a flood (as a
+        // source) but a signal can't propagate *through* a clamped node —
+        // otherwise a path VDD→…→GND→net would wrongly mark `net`
+        // one-reachable. So block expansion at every fixed net except this
+        // flood's own sources.
+        let block_one = block_mask(&is_fixed, &one_src);
+        let block_zero = block_mask(&is_fixed, &zero_src);
+        let strong_one = flood(&strong, &one_src, net_count, &block_one);
+        let strong_zero = flood(&strong, &zero_src, net_count, &block_zero);
+        let maybe_one = flood(&maybe, &one_src, net_count, &block_one);
+        let maybe_zero = flood(&maybe, &zero_src, net_count, &block_zero);
 
         let mut next = val.clone();
         for n in 0..net_count {
@@ -176,8 +185,16 @@ fn resolve(
     }
 }
 
-/// BFS reachability from `sources` over an undirected adjacency list.
-fn flood(adj: &[Vec<usize>], sources: &[usize], net_count: usize) -> Vec<bool> {
+/// BFS reachability from `sources` over an undirected adjacency list. A
+/// node flagged in `block_expand` is recorded as reached but never
+/// expanded — used to stop floods from tunnelling through clamped driver
+/// nets.
+fn flood(
+    adj: &[Vec<usize>],
+    sources: &[usize],
+    net_count: usize,
+    block_expand: &[bool],
+) -> Vec<bool> {
     let mut seen = vec![false; net_count];
     let mut stack = Vec::new();
     for &s in sources {
@@ -187,6 +204,9 @@ fn flood(adj: &[Vec<usize>], sources: &[usize], net_count: usize) -> Vec<bool> {
         }
     }
     while let Some(n) = stack.pop() {
+        if block_expand[n] {
+            continue;
+        }
         for &m in &adj[n] {
             if !seen[m] {
                 seen[m] = true;
@@ -195,6 +215,18 @@ fn flood(adj: &[Vec<usize>], sources: &[usize], net_count: usize) -> Vec<bool> {
         }
     }
     seen
+}
+
+/// `is_fixed` with each source cleared — the barrier set for a flood from
+/// those sources (sources must stay expandable).
+fn block_mask(is_fixed: &[bool], sources: &[usize]) -> Vec<bool> {
+    let mut b = is_fixed.to_vec();
+    for &s in sources {
+        if s < b.len() {
+            b[s] = false;
+        }
+    }
+    b
 }
 
 #[cfg(test)]

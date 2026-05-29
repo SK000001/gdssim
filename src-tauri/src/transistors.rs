@@ -177,6 +177,22 @@ pub fn extract(polys: &[Polygon], tech: &Tech) -> Extraction {
     Extraction { transistors, device_nets, device_polys }
 }
 
+/// Device net id at world point `p`: the smallest device polygon
+/// containing it. Maps a coordinate to a refined net — used by tests and
+/// tools; mirrors the frontend's TS hit-test.
+pub fn device_net_at(ext: &Extraction, p: [f64; 2]) -> Option<u32> {
+    let mut best: Option<(f64, u32)> = None;
+    for (i, poly) in ext.device_polys.iter().enumerate() {
+        if gds::point_in_polygon(&poly.points, p) {
+            let a = gds::polygon_area(&poly.points);
+            if best.map_or(true, |(ba, _)| a < ba) {
+                best = Some((a, ext.device_nets.net_of[i]));
+            }
+        }
+    }
+    best.map(|(_, n)| n)
+}
+
 /// The channel rectangle where `poly` crosses `diff`, or `None` if they
 /// don't actually overlap. Exact for axis-aligned rectangles; the centre
 /// point-in-polygon guard rejects bbox-only overlaps of non-Manhattan
