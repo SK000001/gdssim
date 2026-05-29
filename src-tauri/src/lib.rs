@@ -8,10 +8,12 @@
 
 mod gds;
 mod geometry;
+mod sim;
 mod tech;
 mod transistors;
 mod viewport;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -111,6 +113,20 @@ fn net_rings(net_id: u32, store: tauri::State<LoadStore>) -> Vec<Vec<[f64; 2]>> 
         .collect()
 }
 
+/// Run the switch-level digital sim (H5) over the extracted transistors.
+/// `fixed` is the list of driver nets — `(net_id, value)` for VDD (1),
+/// GND (0), and each input. Returns one logic value per device net.
+#[tauri::command]
+fn simulate_nets(fixed: Vec<(u32, sim::Logic)>, store: tauri::State<LoadStore>) -> Vec<sim::Logic> {
+    let loaded = store.0.lock().unwrap();
+    let map: HashMap<u32, sim::Logic> = fixed.into_iter().collect();
+    sim::simulate(
+        &loaded.extraction.transistors,
+        loaded.extraction.device_nets.count(),
+        &map,
+    )
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = env_logger::try_init();
@@ -124,7 +140,8 @@ pub fn run() {
             hit_test,
             net_rings,
             transistors,
-            device_net_rings
+            device_net_rings,
+            simulate_nets
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

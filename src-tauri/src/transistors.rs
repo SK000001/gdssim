@@ -291,7 +291,7 @@ fn rect_polygon(layer: i16, datatype: i16, b: &Bbox) -> Polygon {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn rect(layer: i16, x0: f64, y0: f64, x1: f64, y1: f64) -> Polygon {
@@ -304,8 +304,8 @@ mod tests {
     /// Build a full CMOS inverter: shared vertical poly gate crossing a
     /// PMOS active (inside nwell, top) and an NMOS active (bottom); source
     /// & drain contacts up to metal1; the two drains tied by one output
-    /// metal strip.
-    fn inverter() -> Vec<Polygon> {
+    /// metal strip. Shared with the H5 sim tests via `pub(crate)`.
+    pub(crate) fn inverter() -> Vec<Polygon> {
         vec![
             // nwell over the PMOS half.
             rect(8, 0.0, 1000.0, 3000.0, 2300.0),
