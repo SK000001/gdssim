@@ -285,6 +285,7 @@ code {
 .sim-dot.one { background: rgb(228, 70, 70); }
 .sim-dot.zero { background: rgb(78, 140, 255); }
 .sim-dot.x { background: #777; }
+.sim-dot.on { background: rgb(90, 230, 110); }
 
 .sim-roles {
   display: flex;

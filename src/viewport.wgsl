@@ -43,6 +43,8 @@ fn fs_edge(in: VsOut) -> @location(0) vec4<f32> {
 struct HiUniforms {
     proj: mat4x4<f32>,
     color: vec4<f32>,
+    // x = time (s), y = stripe scale (world units per stripe).
+    params: vec4<f32>,
 };
 
 @group(0) @binding(1) var<uniform> hi: HiUniforms;
@@ -55,4 +57,30 @@ fn vs_highlight(in: VsIn) -> @builtin(position) vec4<f32> {
 @fragment
 fn fs_highlight() -> @location(0) vec4<f32> {
     return hi.color;
+}
+
+// Animated "signal flow" fill (H6): diagonal stripes scrolling in world
+// space over time, so an active (driven-high) net visibly flows.
+struct FlowOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) world: vec2<f32>,
+};
+
+@vertex
+fn vs_flow(in: VsIn) -> FlowOut {
+    var out: FlowOut;
+    out.clip = hi.proj * vec4<f32>(in.pos, 0.0, 1.0);
+    out.world = in.pos;
+    return out;
+}
+
+@fragment
+fn fs_flow(in: FlowOut) -> @location(0) vec4<f32> {
+    let t = hi.params.x;
+    let scale = max(hi.params.y, 1.0);
+    // Phase advances along the x+y diagonal and scrolls with time.
+    let phase = (in.world.x + in.world.y) / scale - t;
+    let s = 0.5 + 0.5 * sin(phase * 6.2831853);
+    let a = hi.color.a * (0.5 + 0.5 * s);
+    return vec4<f32>(hi.color.rgb, a);
 }

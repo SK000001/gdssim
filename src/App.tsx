@@ -66,8 +66,10 @@ function deviceNetAt(geom: DeviceGeom, x: number, y: number): number | null {
   return best;
 }
 
-const SIM_RED: [number, number, number, number] = [0.95, 0.25, 0.25, 0.5];
+const SIM_RED: [number, number, number, number] = [0.95, 0.25, 0.25, 0.55];
 const SIM_BLUE: [number, number, number, number] = [0.3, 0.55, 1.0, 0.5];
+const SIM_GREY: [number, number, number, number] = [0.6, 0.6, 0.6, 0.4];
+const SIM_GREEN: [number, number, number, number] = [0.35, 1.0, 0.45, 0.55];
 
 function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -227,17 +229,36 @@ function App() {
     setSimValues(values);
     const ones: [number, number][][] = [];
     const zeros: [number, number][][] = [];
+    const xs: [number, number][][] = [];
     values.forEach((val, net) => {
       const rings = deviceGeom[net];
       if (!rings) return;
       if (val === "one") ones.push(...rings);
       else if (val === "zero") zeros.push(...rings);
+      else xs.push(...rings);
     });
+    // Conducting transistors → a green glow on their gate channel.
+    const onFets: [number, number][][] = [];
+    for (const t of transistors) {
+      const g = values[t.gate_net];
+      const on = (t.kind === "nmos" && g === "one") || (t.kind === "pmos" && g === "zero");
+      if (!on) continue;
+      const [x0, y0] = t.gate_min;
+      const [x1, y1] = t.gate_max;
+      onFets.push([
+        [x0, y0],
+        [x1, y0],
+        [x1, y1],
+        [x0, y1],
+      ]);
+    }
     vp.setSimOverlay([
-      { color: SIM_RED, rings: ones },
+      { color: SIM_GREY, rings: xs },
       { color: SIM_BLUE, rings: zeros },
+      { color: SIM_RED, rings: ones, flow: true },
+      { color: SIM_GREEN, rings: onFets },
     ]);
-  }, [vddNet, gndNet, inputs, deviceGeom]);
+  }, [vddNet, gndNet, inputs, deviceGeom, transistors]);
 
   // Re-solve whenever assignments change; clear the overlay when sim mode
   // is off.
@@ -399,6 +420,7 @@ function App() {
               <span className="sim-dot one" /> 1
               <span className="sim-dot zero" /> 0
               <span className="sim-dot x" /> X
+              <span className="sim-dot on" /> on
             </span>
           </div>
 

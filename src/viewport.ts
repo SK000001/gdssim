@@ -91,6 +91,9 @@ type GpuLayer = {
 
 const VERTEX_FLOATS = 5;
 const MSAA_SAMPLES = 4;
+// Highlight/overlay uniform: mat4 proj (64) + vec4 colour (16) + vec4
+// params (16) = 96 bytes.
+const HI_UNIFORM_SIZE = 96;
 
 /** Signed area of a ring (shoelace); >0 is counter-clockwise. */
 function ringSignedArea(p: [number, number][]): number {
@@ -206,16 +209,21 @@ export class Viewport {
   // Triangulated highlight rings for the translucent fill.
   private hiTris: GPUBuffer | null = null;
   private hiTriCount = 0;
-  // Sim value overlay (H5b): per-colour translucent fills (e.g. red=1,
-  // blue=0) drawn under the selection highlight.
+  // Sim value overlay (H5b/H6): per-colour fills (red=1, blue=0, grey=X,
+  // green=conducting) drawn under the selection highlight; `flow` groups
+  // animate scrolling stripes (H6 signal flow).
   private simGroups: {
     vbuf: GPUBuffer;
     tris: GPUBuffer;
     triCount: number;
     buf: GPUBuffer;
     bg: GPUBindGroup;
+    flow: boolean;
+    scale: number;
   }[] = [];
+  private flowPipeline!: GPURenderPipeline;
   private hiBgLayout!: GPUBindGroupLayout;
+  private startTime = performance.now();
   private cam = {
     center: [0, 0] as [number, number],
     halfH: 150,
@@ -366,7 +374,7 @@ export class Viewport {
     for (const [x, y] of ring4) specs.push({ dx: x * CORE, dy: y * CORE, color: core });
     this.hiPasses = specs.map((s) => {
       const buf = this.device.createBuffer({
-        size: 80,
+        size: HI_UNIFORM_SIZE,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
       // Colour is constant per pass; write it once. The proj (offset 0) is
@@ -401,8 +409,28 @@ export class Viewport {
       primitive: { topology: "triangle-list" },
       multisample: { count: MSAA_SAMPLES },
     });
+    // Animated signal-flow fill (H6): scrolling stripes via vs_flow/fs_flow.
+    this.flowPipeline = this.device.createRenderPipeline({
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [hiBgLayout] }),
+      vertex: { module: shader, entryPoint: "vs_flow", buffers: vertexState.buffers },
+      fragment: {
+        module: shader,
+        entryPoint: "fs_flow",
+        targets: [
+          {
+            format: this.format,
+            blend: {
+              color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+              alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+            },
+          },
+        ],
+      },
+      primitive: { topology: "triangle-list" },
+      multisample: { count: MSAA_SAMPLES },
+    });
     this.hiFillBuf = this.device.createBuffer({
-      size: 80,
+      size: HI_UNIFORM_SIZE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     // Low-alpha yellow wash; proj (offset 0) refreshed per frame.
@@ -512,15 +540,26 @@ export class Viewport {
   }
 
   /**
-   * Sim value overlay (H5b): paint each group's polygon rings with a
-   * translucent colour (e.g. red for logic 1, blue for 0). Pass an empty
-   * array or `null` to clear. Drawn under the selection highlight.
+   * Sim value overlay (H5b/H6): paint each group's polygon rings with a
+   * translucent colour (e.g. red=1, blue=0, grey=X, green=conducting).
+   * A group with `flow: true` animates scrolling stripes (signal flow).
+   * Pass an empty array or `null` to clear. Drawn under the selection
+   * highlight.
    */
   setSimOverlay(
-    groups: { color: [number, number, number, number]; rings: [number, number][][] }[] | null
+    groups:
+      | { color: [number, number, number, number]; rings: [number, number][][]; flow?: boolean }[]
+      | null
   ) {
     this.clearSimOverlay();
     if (!groups) return;
+    // Stripe period scaled to the loaded layout so flow reads at any size.
+    const span = Math.max(
+      this.cam.bbox.max[0] - this.cam.bbox.min[0],
+      this.cam.bbox.max[1] - this.cam.bbox.min[1],
+      1
+    );
+    const stripeScale = span / 22;
     for (const g of groups) {
       const totalPts = g.rings.reduce((s, r) => s + r.length, 0);
       if (totalPts < 3) continue;
@@ -550,7 +589,7 @@ export class Viewport {
       });
       this.device.queue.writeBuffer(tbuf, 0, tarr);
       const buf = this.device.createBuffer({
-        size: 80,
+        size: HI_UNIFORM_SIZE,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
       this.device.queue.writeBuffer(buf, 64, new Float32Array(g.color));
@@ -558,7 +597,15 @@ export class Viewport {
         layout: this.hiBgLayout,
         entries: [{ binding: 1, resource: { buffer: buf } }],
       });
-      this.simGroups.push({ vbuf, tris: tbuf, triCount: tarr.length, buf, bg });
+      this.simGroups.push({
+        vbuf,
+        tris: tbuf,
+        triCount: tarr.length,
+        buf,
+        bg,
+        flow: !!g.flow,
+        scale: stripeScale,
+      });
     }
   }
 
@@ -832,11 +879,17 @@ export class Viewport {
         pass.setIndexBuffer(l.edges, "uint32");
         pass.drawIndexed(l.edgeCount);
       }
-      // Sim value overlay first (under selection): per-colour fills.
+      // Sim value overlay first (under selection): per-colour fills, with
+      // animated stripes for `flow` groups.
       if (this.simGroups.length > 0) {
-        pass.setPipeline(this.highlightFillPipeline);
+        const time = (performance.now() - this.startTime) / 1000;
         for (const g of this.simGroups) {
           this.device.queue.writeBuffer(g.buf, 0, this.proj);
+          if (g.flow) {
+            // params at byte offset 80: [time, stripeScale, 0, 0].
+            this.device.queue.writeBuffer(g.buf, 80, new Float32Array([time, g.scale, 0, 0]));
+          }
+          pass.setPipeline(g.flow ? this.flowPipeline : this.highlightFillPipeline);
           pass.setBindGroup(0, g.bg);
           pass.setVertexBuffer(0, g.vbuf);
           pass.setIndexBuffer(g.tris, "uint32");
