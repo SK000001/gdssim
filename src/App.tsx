@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Viewport, type SceneData, type LayerInfo, type Diag } from "./viewport";
+import { Viewport, type SceneData, type LayerInfo, type Diag, type PolygonHit } from "./viewport";
 import "./App.css";
 
 type Summary = {
@@ -23,6 +23,7 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [diag, setDiag] = useState<Diag | null>(null);
+  const [selected, setSelected] = useState<PolygonHit | null>(null);
 
   useEffect(() => {
     if (!canvasRef.current) return;
@@ -31,8 +32,21 @@ function App() {
     vp.onSceneChanged = (newLayers) => {
       setLayers(newLayers);
       setHidden(new Set());
+      setSelected(null);
     };
     vp.onDiag = (d) => setDiag(d);
+    vp.onPick = async (world) => {
+      try {
+        const hit = await invoke<PolygonHit | null>("hit_test", {
+          x: world[0],
+          y: world[1],
+        });
+        setSelected(hit);
+        vp.setHighlight(hit ? hit.points : null);
+      } catch (e) {
+        setError(String(e));
+      }
+    };
     vp.init()
       .then((ok) => {
         setGpuReady(ok);
@@ -102,7 +116,7 @@ function App() {
           Fit (F)
         </button>
         <span className="title">GDSSIM</span>
-        <span className="tag">H2c · layers + MSAA + edges</span>
+        <span className="tag">H2d · click to inspect</span>
         <span className="spacer" />
         {loaded && (
           <span className="summary">
@@ -162,6 +176,43 @@ function App() {
         </div>
       )}
 
+      {selected && (
+        <div className="inspector">
+          <div className="lp-hd">
+            Selection
+            <button
+              className="insp-x"
+              title="Clear selection"
+              onClick={() => {
+                setSelected(null);
+                viewportRef.current?.setHighlight(null);
+              }}
+            >
+              ×
+            </button>
+          </div>
+          <dl className="insp-grid">
+            <dt>Layer</dt>
+            <dd>{selected.layer}</dd>
+            <dt>Datatype</dt>
+            <dd>{selected.datatype}</dd>
+            <dt>Vertices</dt>
+            <dd>{selected.point_count}</dd>
+            <dt>Area</dt>
+            <dd>{selected.area.toLocaleString()} du²</dd>
+            <dt>BBox</dt>
+            <dd>
+              {Math.round(selected.bbox_max[0] - selected.bbox_min[0])} ×{" "}
+              {Math.round(selected.bbox_max[1] - selected.bbox_min[1])} du
+            </dd>
+            <dt>Origin</dt>
+            <dd>
+              ({Math.round(selected.bbox_min[0])}, {Math.round(selected.bbox_min[1])})
+            </dd>
+          </dl>
+        </div>
+      )}
+
       {error && (
         <div className="overlay overlay-err">
           <strong>Error</strong>
@@ -173,7 +224,7 @@ function App() {
         <div className="overlay">
           <p>Open a <code>.gds</code> file to start.</p>
           <p className="muted">
-            Mouse wheel = zoom · middle drag = pan · <code>F</code> = fit · <code>+/-</code> = step zoom
+            Left click = inspect · wheel = zoom · middle drag = pan · <code>F</code> = fit · <code>+/-</code> = step zoom
           </p>
           {loadedPath && <p className="muted">Last picked: {loadedPath}</p>}
         </div>

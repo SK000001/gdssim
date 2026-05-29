@@ -34,3 +34,10 @@ fn fs_edge(in: VsOut) -> @location(0) vec4<f32> {
     let bright = clamp(in.color * 1.5 + vec3<f32>(0.18), vec3<f32>(0.0), vec3<f32>(1.0));
     return vec4<f32>(bright, 1.0);
 }
+
+@fragment
+fn fs_highlight(in: VsOut) -> @location(0) vec4<f32> {
+    // Selection outline: a fixed bright colour, independent of the
+    // polygon's layer colour, so the picked feature always stands out.
+    return vec4<f32>(1.0, 0.92, 0.25, 1.0);
+}

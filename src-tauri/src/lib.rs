@@ -10,6 +10,14 @@ mod gds;
 mod viewport;
 
 use std::path::PathBuf;
+use std::sync::Mutex;
+
+use gds::Polygon;
+
+/// The flattened polygon list of the currently-loaded GDS, retained so
+/// click hit-testing (H2d) can run against it without re-parsing.
+#[derive(Default)]
+struct PolyStore(Mutex<Vec<Polygon>>);
 
 #[tauri::command]
 fn ping() -> &'static str {
@@ -17,7 +25,7 @@ fn ping() -> &'static str {
 }
 
 #[tauri::command]
-fn load_gds(path: String) -> Result<viewport::Scene, String> {
+fn load_gds(path: String, store: tauri::State<PolyStore>) -> Result<viewport::Scene, String> {
     let path = PathBuf::from(path);
     let info = std::panic::catch_unwind(|| gds::load_and_flatten(&path))
         .map_err(|p| {
@@ -29,7 +37,17 @@ fn load_gds(path: String) -> Result<viewport::Scene, String> {
             format!("parser panic: {msg}")
         })?
         .map_err(|e| e.to_string())?;
-    Ok(viewport::build_scene(&info))
+    let scene = viewport::build_scene(&info);
+    *store.0.lock().unwrap() = info.polygons;
+    Ok(scene)
+}
+
+/// Hit-test a world-space click against the loaded polygons. Returns
+/// the smallest containing polygon, or `null` when the click misses.
+#[tauri::command]
+fn hit_test(x: f64, y: f64, store: tauri::State<PolyStore>) -> Option<viewport::PolygonHit> {
+    let polys = store.0.lock().unwrap();
+    viewport::hit_test(&polys, x, y)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -38,7 +56,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![ping, load_gds])
+        .manage(PolyStore::default())
+        .invoke_handler(tauri::generate_handler![ping, load_gds, hit_test])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

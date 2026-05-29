@@ -21,7 +21,6 @@ use thiserror::Error;
 #[derive(Debug, Clone)]
 pub struct Polygon {
     pub layer: i16,
-    #[allow(dead_code)] // surfaced via inspector in H2d
     pub datatype: i16,
     /// Closed ring; first point is NOT repeated as the last.
     pub points: Vec<[f64; 2]>,
@@ -155,6 +154,56 @@ pub fn bbox(polys: &[Polygon]) -> Bbox {
         }
     }
     b
+}
+
+/// Bbox of a single polygon ring.
+pub fn polygon_bbox(points: &[[f64; 2]]) -> Bbox {
+    let mut b = Bbox::empty();
+    for pt in points {
+        b.expand(*pt);
+    }
+    b
+}
+
+/// Unsigned area of a polygon ring (shoelace formula). Ring is assumed
+/// closed implicitly (first point NOT repeated as last — matches how we
+/// store [`Polygon::points`]).
+pub fn polygon_area(points: &[[f64; 2]]) -> f64 {
+    let n = points.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut sum = 0.0;
+    for i in 0..n {
+        let a = points[i];
+        let b = points[(i + 1) % n];
+        sum += a[0] * b[1] - b[0] * a[1];
+    }
+    (sum * 0.5).abs()
+}
+
+/// Point-in-polygon test (ray casting / even-odd rule). Ring is treated
+/// as closed; points on the boundary may test either way — good enough
+/// for click selection.
+pub fn point_in_polygon(points: &[[f64; 2]], p: [f64; 2]) -> bool {
+    let n = points.len();
+    if n < 3 {
+        return false;
+    }
+    let (px, py) = (p[0], p[1]);
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = (points[i][0], points[i][1]);
+        let (xj, yj) = (points[j][0], points[j][1]);
+        let intersects = (yi > py) != (yj > py)
+            && px < (xj - xi) * (py - yi) / (yj - yi) + xi;
+        if intersects {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
 }
 
 /// Pick the "top" structure: one that no other struct references.
@@ -500,6 +549,29 @@ mod tests {
         assert_eq!(&out[32..34], &[0x07, 0xBC]);
         // STRNAME unchanged.
         assert_eq!(&out[60..64], b"TOP_");
+    }
+
+    #[test]
+    fn point_in_polygon_and_area() {
+        // 10×10 square at origin.
+        let sq = [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        assert!(point_in_polygon(&sq, [5.0, 5.0]));
+        assert!(!point_in_polygon(&sq, [15.0, 5.0]));
+        assert!(!point_in_polygon(&sq, [-1.0, 5.0]));
+        assert!((polygon_area(&sq) - 100.0).abs() < 1e-9);
+
+        let b = polygon_bbox(&sq);
+        assert_eq!(b.min, [0.0, 0.0]);
+        assert_eq!(b.max, [10.0, 10.0]);
+
+        // Concave L-shape: the notch should test as outside.
+        let l = [
+            [0.0, 0.0], [10.0, 0.0], [10.0, 4.0],
+            [4.0, 4.0], [4.0, 10.0], [0.0, 10.0],
+        ];
+        assert!(point_in_polygon(&l, [2.0, 2.0]));   // in the foot
+        assert!(point_in_polygon(&l, [2.0, 8.0]));   // in the upright
+        assert!(!point_in_polygon(&l, [8.0, 8.0]));  // in the notch
     }
 
     #[test]

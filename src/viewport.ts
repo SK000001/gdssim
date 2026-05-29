@@ -34,6 +34,18 @@ export type LayerInfo = {
   polygon_count: number;
 };
 
+/** Result of the `hit_test` IPC command (selection inspector). */
+export type PolygonHit = {
+  index: number;
+  layer: number;
+  datatype: number;
+  point_count: number;
+  bbox_min: [number, number];
+  bbox_max: [number, number];
+  area: number;
+  points: [number, number][];
+};
+
 export type Diag = {
   canvasW: number;
   canvasH: number;
@@ -64,11 +76,17 @@ export class Viewport {
   private format!: GPUTextureFormat;
   private fillPipeline!: GPURenderPipeline;
   private edgePipeline!: GPURenderPipeline;
+  private highlightPipeline!: GPURenderPipeline;
   private uniformBuf!: GPUBuffer;
   private uniformBg!: GPUBindGroup;
   private msaaTex: GPUTexture | null = null;
   private msaaView: GPUTextureView | null = null;
   private gpuLayers: GpuLayer[] = [];
+  // Selection highlight (H2d): the picked polygon's ring drawn as a
+  // bright line-loop on top of everything.
+  private hiVbuf: GPUBuffer | null = null;
+  private hiEdges: GPUBuffer | null = null;
+  private hiEdgeCount = 0;
   private cam = {
     center: [0, 0] as [number, number],
     halfH: 150,
@@ -81,6 +99,8 @@ export class Viewport {
   /** Called whenever scene metadata changes (after load). */
   public onSceneChanged: ((layers: LayerInfo[]) => void) | null = null;
   public onDiag: ((d: Diag) => void) | null = null;
+  /** Called on a left-click with the world-space coordinates of the click. */
+  public onPick: ((world: [number, number]) => void) | null = null;
   private diag: Diag = { canvasW: 0, canvasH: 0, msaaW: 0, msaaH: 0, layers: 0, frames: 0, err: null };
 
   constructor(canvas: HTMLCanvasElement) {
@@ -165,6 +185,18 @@ export class Viewport {
       multisample: { count: MSAA_SAMPLES },
     });
 
+    this.highlightPipeline = this.device.createRenderPipeline({
+      layout: pipelineLayout,
+      vertex: vertexState,
+      fragment: {
+        module: shader,
+        entryPoint: "fs_highlight",
+        targets: [{ format: this.format }],
+      },
+      primitive: { topology: "line-list" },
+      multisample: { count: MSAA_SAMPLES },
+    });
+
     this.attachInput();
     this.resize();
     new ResizeObserver(() => this.resize()).observe(this.canvas);
@@ -176,9 +208,48 @@ export class Viewport {
   destroy() {
     this.destroyed = true;
     this.releaseLayerBuffers();
+    this.clearHighlight();
     this.msaaTex?.destroy();
     this.msaaTex = null;
     this.msaaView = null;
+  }
+
+  private clearHighlight() {
+    this.hiVbuf?.destroy();
+    this.hiEdges?.destroy();
+    this.hiVbuf = null;
+    this.hiEdges = null;
+    this.hiEdgeCount = 0;
+  }
+
+  /** Highlight a polygon ring (database units), or clear with `null`. */
+  setHighlight(ring: [number, number][] | null) {
+    this.clearHighlight();
+    if (!ring || ring.length < 2) return;
+    const n = ring.length;
+    // Interleaved (x, y, r, g, b); colour is unused by fs_highlight.
+    const verts = new Float32Array(n * VERTEX_FLOATS);
+    for (let i = 0; i < n; i++) {
+      verts[i * VERTEX_FLOATS] = ring[i][0];
+      verts[i * VERTEX_FLOATS + 1] = ring[i][1];
+    }
+    // Closed line-loop: pairs (i → (i+1) mod n).
+    const idx = new Uint32Array(n * 2);
+    for (let i = 0; i < n; i++) {
+      idx[i * 2] = i;
+      idx[i * 2 + 1] = (i + 1) % n;
+    }
+    this.hiVbuf = this.device.createBuffer({
+      size: verts.byteLength,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(this.hiVbuf, 0, verts);
+    this.hiEdges = this.device.createBuffer({
+      size: idx.byteLength,
+      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(this.hiEdges, 0, idx);
+    this.hiEdgeCount = idx.length;
   }
 
   private releaseLayerBuffers() {
@@ -192,6 +263,7 @@ export class Viewport {
 
   loadScene(s: SceneData) {
     this.releaseLayerBuffers();
+    this.clearHighlight();
     for (const ld of s.layers) {
       if (ld.vertices.length === 0) continue;
       const verts = new Float32Array(ld.vertices);
@@ -356,6 +428,15 @@ export class Viewport {
       const factor = Math.exp(lines * 0.15);
       this.zoomAt(this.cursor, factor);
     }, { passive: false });
+    c.addEventListener("click", (e) => {
+      if (e.button !== 0 || !this.onPick) return;
+      const r = c.getBoundingClientRect();
+      const p: [number, number] = [
+        (e.clientX - r.left) * (c.width / r.width),
+        (e.clientY - r.top) * (c.height / r.height),
+      ];
+      this.onPick(this.pixelToWorld(p));
+    });
     c.addEventListener("keydown", (e) => {
       if (e.key === "f" || e.key === "F") {
         this.fitView();
@@ -440,6 +521,12 @@ export class Viewport {
         pass.setVertexBuffer(0, l.vbuf);
         pass.setIndexBuffer(l.edges, "uint32");
         pass.drawIndexed(l.edgeCount);
+      }
+      if (this.hiVbuf && this.hiEdges && this.hiEdgeCount > 0) {
+        pass.setPipeline(this.highlightPipeline);
+        pass.setVertexBuffer(0, this.hiVbuf);
+        pass.setIndexBuffer(this.hiEdges, "uint32");
+        pass.drawIndexed(this.hiEdgeCount);
       }
       pass.end();
       this.device.queue.submit([enc.finish()]);

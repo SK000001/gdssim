@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::gds::{self, LoadInfo};
+use crate::gds::{self, LoadInfo, Polygon};
 
 /// Deterministic colour per GDS layer. H2c-followup will swap this
 /// for a JSON technology file (mapping (layer, datatype) → name + colour).
@@ -67,6 +67,52 @@ pub struct Scene {
     pub layers: Vec<LayerData>,
     pub top_cell: String,
     pub cell_names: Vec<String>,
+}
+
+/// Result of a viewport click hit-test, IPC'd back to the React
+/// inspector. `points` is the polygon ring (database units) so the
+/// frontend can draw a highlight outline without re-deriving it.
+#[derive(Debug, Serialize)]
+pub struct PolygonHit {
+    /// Index into the flattened polygon list (stable for the session).
+    pub index: usize,
+    pub layer: i16,
+    pub datatype: i16,
+    pub point_count: usize,
+    pub bbox_min: [f64; 2],
+    pub bbox_max: [f64; 2],
+    pub area: f64,
+    /// Ring vertices for the highlight outline.
+    pub points: Vec<[f64; 2]>,
+}
+
+/// Find the polygon under world point `(x, y)`. When several overlap,
+/// the smallest-area one wins — that's almost always the most specific
+/// feature the user meant to click (e.g. a contact inside a metal pad).
+pub fn hit_test(polys: &[Polygon], x: f64, y: f64) -> Option<PolygonHit> {
+    let p = [x, y];
+    let mut best: Option<(usize, f64)> = None;
+    for (i, poly) in polys.iter().enumerate() {
+        if gds::point_in_polygon(&poly.points, p) {
+            let area = gds::polygon_area(&poly.points);
+            if best.map_or(true, |(_, a)| area < a) {
+                best = Some((i, area));
+            }
+        }
+    }
+    let (index, area) = best?;
+    let poly = &polys[index];
+    let bb = gds::polygon_bbox(&poly.points);
+    Some(PolygonHit {
+        index,
+        layer: poly.layer,
+        datatype: poly.datatype,
+        point_count: poly.points.len(),
+        bbox_min: bb.min,
+        bbox_max: bb.max,
+        area,
+        points: poly.points.clone(),
+    })
 }
 
 pub fn build_scene(info: &LoadInfo) -> Scene {
@@ -130,5 +176,45 @@ pub fn build_scene(info: &LoadInfo) -> Scene {
         layers,
         top_cell: info.top_cell.clone(),
         cell_names: info.cell_names.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(layer: i16, datatype: i16, x0: f64, y0: f64, x1: f64, y1: f64) -> Polygon {
+        Polygon {
+            layer,
+            datatype,
+            points: vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
+        }
+    }
+
+    #[test]
+    fn hit_test_picks_smallest_containing_polygon() {
+        // A big metal pad (layer 4) with a small contact (layer 3) inside it.
+        let polys = vec![
+            rect(4, 0, 0.0, 0.0, 100.0, 100.0),
+            rect(3, 7, 40.0, 40.0, 60.0, 60.0),
+        ];
+
+        // Click inside the contact → smallest-area wins (the contact).
+        let hit = hit_test(&polys, 50.0, 50.0).expect("hit");
+        assert_eq!(hit.index, 1);
+        assert_eq!(hit.layer, 3);
+        assert_eq!(hit.datatype, 7);
+        assert_eq!(hit.point_count, 4);
+        assert!((hit.area - 400.0).abs() < 1e-9);
+        assert_eq!(hit.bbox_min, [40.0, 40.0]);
+        assert_eq!(hit.bbox_max, [60.0, 60.0]);
+
+        // Click in the pad but outside the contact → the pad.
+        let hit = hit_test(&polys, 10.0, 10.0).expect("hit");
+        assert_eq!(hit.index, 0);
+        assert_eq!(hit.layer, 4);
+
+        // Click outside everything → miss.
+        assert!(hit_test(&polys, 200.0, 200.0).is_none());
     }
 }
